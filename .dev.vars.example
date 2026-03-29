@@ -1,0 +1,6 @@
+# Copy to .dev.vars for local wrangler dev testing.
+# Gemini API key is loaded from DB table gemini_keys at runtime.
+DATABASE_URL=postgresql://user:password@host:5432/dbname
+TELEGRAM_BOT_TOKEN=123456:telegram-token
+TELEGRAM_WEBHOOK_SECRET=replace-with-random-secret
+GEMINI_MODEL=gemini-3-flash-preview

@@ -1,0 +1,90 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  telegram_id  String   @unique
+  first_name   String?
+  timezone     String?
+  calorie_goal Int?
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  food_logs FoodLog[]
+
+  @@map("users")
+}
+
+model ConversationState {
+  telegram_id String   @id
+  state       String   @default("idle")
+  context     Json?
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  @@map("conversation_state")
+}
+
+model GeminiKey {
+  id         Int      @id @default(autoincrement())
+  label      String
+  project_id String?
+  api_key    String
+  is_active  Boolean  @default(true)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@map("gemini_keys")
+}
+
+model FoodLog {
+  id              Int       @id @default(autoincrement())
+  user_id         Int
+  session_id      String?
+  log_date        DateTime  @db.Date
+  meal_type       String?
+  ai_raw_response String?
+  confirmed       Boolean   @default(false)
+  is_deleted      Boolean   @default(false)
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  user       User       @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  food_items FoodItem[]
+
+  @@index([user_id, log_date])
+  @@map("food_logs")
+}
+
+model FoodItem {
+  id           Int      @id @default(autoincrement())
+  food_log_id  Int
+  name         String
+  calories     Float?
+  protein_g    Float?
+  carbs_g      Float?
+  fat_g        Float?
+  raw_json     Json?
+  data_source  String   @default("ai_text")
+  is_deleted   Boolean  @default(false)
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  food_log FoodLog @relation(fields: [food_log_id], references: [id], onDelete: Cascade)
+
+  @@index([food_log_id])
+  @@map("food_items")
+}
