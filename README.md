@@ -1,23 +1,40 @@
-# NutriBot Worker
+# Telegram AI CalTracker Bot
 
-Telegram nutrition logging bot running on Cloudflare Workers with Gemini extraction and PostgreSQL persistence.
+AI-powered Telegram calorie and nutrition tracker running on Cloudflare Workers. The bot extracts meal details with Gemini, stores logs in PostgreSQL, and gives daily summaries.
 
-## Features
+## What It Does
 
-- Telegram webhook endpoint with secret validation
-- Onboarding flow (`/start`)
-- AI nutrition extraction from plain text meals
-- Save/cancel confirmation buttons
-- Daily summary (`/today`)
-- Soft delete by name (`/delete <food_name>`)
+- Onboards users with name, timezone, and calorie goal
+- Logs meals from free-text input using AI extraction
+- Supports guided logging with `/log` and review buttons
+- Saves detailed nutrient fields for each food item
+- Shows grouped daily totals with `/today`
+
+## Bot Access
+
+Use either option below:
+
+1. Open bot link: `https://t.me/DIETTRACKERAIBOT`
+2. Scan QR code:
+
+![Telegram Bot QR](docs/images/telegram-bot-qr.png)
+
+Place your QR image at `docs/images/telegram-bot-qr.png` so it renders on GitHub.
+
+## Commands
+
+- `/start` - Start onboarding
+- `/log` - Start guided logging (bot asks for meal text next)
+- `/log <meal text>` - Quick log in one message
+- `/today` - Show today's saved foods and totals
 
 ## Tech Stack
 
 - Cloudflare Workers + Wrangler
 - TypeScript
-- PostgreSQL runtime client (`postgres`)
-- Prisma schema and client generation
-- Gemini SDK (`@google/genai`)
+- PostgreSQL (`postgres` runtime client)
+- Prisma schema and migrations
+- Gemini API
 
 ## Project Structure
 
@@ -25,17 +42,19 @@ Telegram nutrition logging bot running on Cloudflare Workers with Gemini extract
 src/
 	data/db.ts
 	handlers/telegram-handler.ts
-	services/nutrition.ts
+	services/ai.ts
 	services/telegram.ts
 	types/index.ts
 	worker.ts
+docs/
+	backend-architecture-v2.md
 ```
 
 ## Prerequisites
 
 - Node.js 20+
 - npm
-- Cloudflare account (Wrangler auth)
+- Cloudflare account
 - PostgreSQL database
 - Telegram bot token
 
@@ -53,8 +72,8 @@ wrangler secret put TELEGRAM_BOT_TOKEN
 wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
-`GEMINI_MODEL` is configured via `wrangler.toml` vars.
-Gemini API key is read from the database table `gemini_keys` (`is_active = true`).
+`GEMINI_MODEL` is configured via `wrangler.toml`.
+Gemini API keys are loaded from DB table `gemini_keys`.
 
 ## Local Development
 
@@ -72,10 +91,10 @@ npm run cf:deploy
 
 ## Endpoints
 
-- `GET /health` -> health response
-- `POST /telegram-webhook` -> Telegram updates
+- `GET /health` - Health check
+- `POST /telegram-webhook` - Telegram updates
 
-## Prisma
+## Database and Prisma
 
 ```bash
 npm run prisma:validate
@@ -83,17 +102,8 @@ npm run prisma:generate
 npm run prisma:push
 ```
 
-## Quality Checks
+## Type Check
 
 ```bash
 npm run typecheck
-```
-
-## GitHub Push
-
-```bash
-git add .
-git commit -m "chore: prepare nutribot worker"
-git remote add origin <your-repo-url>
-git push -u origin main
 ```
