@@ -23,6 +23,89 @@ export class GeminiQuotaExhaustedError extends Error {
 const GEMINI_TIMEOUT_MS = 12000;
 const GEMINI_FALLBACK_MODEL = 'gemini-2.5-flash';
 const FOOD_EXTRACTION_SCHEMA = '{"items":[{"name":"string","quantity":"number","unit":"g|ml|piece|cup|tbsp|tsp|oz","calories_kcal":"number|null","protein_g":"number|null","carbs_g":"number|null","fat_g":"number|null","fiber_g":"number|null","sugar_g":"number|null","net_carbs_g":"number|null","saturated_fat_g":"number|null","trans_fat_g":"number|null","monounsaturated_fat_g":"number|null","polyunsaturated_fat_g":"number|null","cholesterol_mg":"number|null","sodium_mg":"number|null","potassium_mg":"number|null","calcium_mg":"number|null","iron_mg":"number|null","magnesium_mg":"number|null","phosphorus_mg":"number|null","zinc_mg":"number|null","selenium_mcg":"number|null","vitamin_a_mcg":"number|null","vitamin_c_mg":"number|null","vitamin_d_mcg":"number|null","vitamin_e_mg":"number|null","vitamin_k_mcg":"number|null","vitamin_b1_mg":"number|null","vitamin_b2_mg":"number|null","vitamin_b3_mg":"number|null","vitamin_b5_mg":"number|null","vitamin_b6_mg":"number|null","vitamin_b9_mcg":"number|null","vitamin_b12_mcg":"number|null","glycemic_index":"number|null","glycemic_load":"number|null","omega3_g":"number|null","omega6_g":"number|null","water_content_g":"number|null","confidence_score":"number|null","notes":"string|null"}],"meal_notes":"string|null"}';
+const FOOD_EXTRACTION_RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          quantity: { type: 'number' },
+          unit: { type: 'string', enum: ['g', 'ml', 'piece', 'cup', 'tbsp', 'tsp', 'oz'] },
+          calories_kcal: { type: 'number', nullable: true },
+          protein_g: { type: 'number', nullable: true },
+          carbs_g: { type: 'number', nullable: true },
+          fat_g: { type: 'number', nullable: true },
+          fiber_g: { type: 'number', nullable: true },
+          sugar_g: { type: 'number', nullable: true },
+          net_carbs_g: { type: 'number', nullable: true },
+          saturated_fat_g: { type: 'number', nullable: true },
+          trans_fat_g: { type: 'number', nullable: true },
+          monounsaturated_fat_g: { type: 'number', nullable: true },
+          polyunsaturated_fat_g: { type: 'number', nullable: true },
+          cholesterol_mg: { type: 'number', nullable: true },
+          sodium_mg: { type: 'number', nullable: true },
+          potassium_mg: { type: 'number', nullable: true },
+          calcium_mg: { type: 'number', nullable: true },
+          iron_mg: { type: 'number', nullable: true },
+          magnesium_mg: { type: 'number', nullable: true },
+          phosphorus_mg: { type: 'number', nullable: true },
+          zinc_mg: { type: 'number', nullable: true },
+          selenium_mcg: { type: 'number', nullable: true },
+          vitamin_a_mcg: { type: 'number', nullable: true },
+          vitamin_c_mg: { type: 'number', nullable: true },
+          vitamin_d_mcg: { type: 'number', nullable: true },
+          vitamin_e_mg: { type: 'number', nullable: true },
+          vitamin_k_mcg: { type: 'number', nullable: true },
+          vitamin_b1_mg: { type: 'number', nullable: true },
+          vitamin_b2_mg: { type: 'number', nullable: true },
+          vitamin_b3_mg: { type: 'number', nullable: true },
+          vitamin_b5_mg: { type: 'number', nullable: true },
+          vitamin_b6_mg: { type: 'number', nullable: true },
+          vitamin_b9_mcg: { type: 'number', nullable: true },
+          vitamin_b12_mcg: { type: 'number', nullable: true },
+          glycemic_index: { type: 'number', nullable: true },
+          glycemic_load: { type: 'number', nullable: true },
+          omega3_g: { type: 'number', nullable: true },
+          omega6_g: { type: 'number', nullable: true },
+          water_content_g: { type: 'number', nullable: true },
+          confidence_score: { type: 'number', nullable: true },
+          notes: { type: 'string', nullable: true },
+        },
+        required: ['name', 'quantity', 'unit'],
+      },
+    },
+    meal_notes: { type: 'string', nullable: true },
+  },
+  required: ['items', 'meal_notes'],
+} as const;
+
+const FOOD_EXTRACTION_COMPACT_RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          quantity: { type: 'number' },
+          unit: { type: 'string', enum: ['g', 'ml', 'piece', 'cup', 'tbsp', 'tsp', 'oz'] },
+          calories_kcal: { type: 'number', nullable: true },
+          protein_g: { type: 'number', nullable: true },
+          carbs_g: { type: 'number', nullable: true },
+          fat_g: { type: 'number', nullable: true },
+          notes: { type: 'string', nullable: true },
+        },
+        required: ['name', 'quantity', 'unit'],
+      },
+    },
+    meal_notes: { type: 'string', nullable: true },
+  },
+  required: ['items', 'meal_notes'],
+} as const;
 
 interface GeminiImageInput {
   data: string;
@@ -77,6 +160,17 @@ function isModelFallbackError(error: unknown): boolean {
   );
 }
 
+function isRecoverableModelOutputError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return (
+    message.includes('max tokens') ||
+    message.includes('truncated') ||
+    message.includes('unexpected end of json input') ||
+    message.includes('unterminated') ||
+    message.includes('json') && message.includes('parse')
+  );
+}
+
 function buildModelCandidates(env: Env): string[] {
   const primary = (env.GEMINI_MODEL || GEMINI_FALLBACK_MODEL).trim();
   return primary === GEMINI_FALLBACK_MODEL ? [primary] : [primary, GEMINI_FALLBACK_MODEL];
@@ -86,7 +180,13 @@ function buildGeminiApiUrl(model: string, apiKey: string): string {
   return `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 }
 
-function buildGeminiRequestBody(model: string, prompt: string, image?: GeminiImageInput): Record<string, unknown> {
+function buildGeminiRequestBody(
+  model: string,
+  prompt: string,
+  image?: GeminiImageInput,
+  responseSchema: Record<string, unknown> = FOOD_EXTRACTION_RESPONSE_SCHEMA,
+  maxOutputTokens = 10000,
+): Record<string, unknown> {
   const parts: Array<Record<string, unknown>> = [{ text: prompt }];
   if (image) {
     parts.push({
@@ -99,8 +199,9 @@ function buildGeminiRequestBody(model: string, prompt: string, image?: GeminiIma
 
   const generationConfig: Record<string, unknown> = {
     responseMimeType: 'application/json',
-    temperature: 1.0,
-    maxOutputTokens: 2048,
+    responseSchema,
+    temperature: 0.2,
+    maxOutputTokens,
   };
 
   if (usesGemini3Thinking(model)) {
@@ -125,6 +226,10 @@ async function callGeminiApi(
   apiKey: string,
   prompt: string,
   image?: GeminiImageInput,
+  options?: {
+    responseSchema?: Record<string, unknown>;
+    maxOutputTokens?: number;
+  },
 ): Promise<{ text: string; latencyMs: number }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
@@ -136,7 +241,15 @@ async function callGeminiApi(
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(buildGeminiRequestBody(model, prompt, image)),
+      body: JSON.stringify(
+        buildGeminiRequestBody(
+          model,
+          prompt,
+          image,
+          options?.responseSchema,
+          options?.maxOutputTokens,
+        ),
+      ),
       signal: controller.signal,
     });
 
@@ -163,7 +276,7 @@ async function callGeminiApi(
       throw new Error(raw.slice(0, 400) || 'Gemini API returned empty text.');
     }
     if (finishReason === 'MAX_TOKENS') {
-      throw new Error('Gemini response was truncated by max tokens.');
+      console.warn('gemini response reached max tokens; attempting parse/retry fallback');
     }
 
     return {
@@ -195,14 +308,52 @@ function asUnit(unit: unknown): FoodItem['unit'] {
   return units.includes(raw as FoodItem['unit']) ? (raw as FoodItem['unit']) : 'g';
 }
 
+function inferQuantityFromName(name: string): { quantity: number | null; name: string; unit?: FoodItem['unit'] } {
+  const trimmed = name.trim();
+  const match = trimmed.match(/^([0-9]+(?:\.[0-9]+)?)\s*(kg|g|grams?|gram|ml|milliliters?|millilitres?|cups?|tbsp|tablespoons?|tsp|teaspoons?|oz|ounces?|pieces?|eggs?|bananas?|apples?|oranges?|roti|rotis|idli|idlis|dosa|dosas|slice|slices)\b\s*(.*)$/i);
+  if (!match) {
+    return { quantity: null, name: trimmed };
+  }
+
+  const quantity = Number.parseFloat(match[1]);
+  if (!Number.isFinite(quantity)) {
+    return { quantity: null, name: trimmed };
+  }
+
+  const unitWord = match[2].toLowerCase();
+  const unit: FoodItem['unit'] = unitWord.startsWith('kg') || unitWord.startsWith('g')
+    ? 'g'
+    : unitWord.startsWith('ml') || unitWord.startsWith('millil')
+      ? 'ml'
+      : unitWord.startsWith('cup')
+        ? 'cup'
+        : unitWord.startsWith('tbsp') || unitWord.startsWith('tablespoon')
+          ? 'tbsp'
+          : unitWord.startsWith('tsp') || unitWord.startsWith('teaspoon')
+            ? 'tsp'
+            : unitWord.startsWith('oz') || unitWord.startsWith('ounce')
+              ? 'oz'
+              : 'piece';
+
+  const normalizedQuantity = unitWord.startsWith('kg') ? quantity * 1000 : quantity;
+  const remainder = match[3].trim();
+  const wholeTokenFoods = new Set(['eggs', 'egg', 'bananas', 'banana', 'apples', 'apple', 'oranges', 'orange', 'roti', 'rotis', 'idli', 'idlis', 'dosa', 'dosas', 'slice', 'slices']);
+  const tokenName = wholeTokenFoods.has(unitWord) ? unitWord : '';
+  const normalizedName = remainder || tokenName || trimmed;
+  return { quantity: normalizedQuantity, name: normalizedName, unit };
+}
+
 function normalizeItem(raw: Record<string, unknown>): FoodItem {
-  const quantity = asNullableNumber(raw.quantity) ?? 1;
+  const inferred = inferQuantityFromName(String(raw.name ?? ''));
+  const rawQuantity = asNullableNumber(raw.quantity) ?? inferred.quantity ?? 1;
+  const quantity = rawQuantity > 0 ? rawQuantity : 1;
   const confidence = asNullableNumber(raw.confidence_score) ?? 0.5;
+  const normalizedName = String(raw.name ?? '').trim();
 
   return {
-    name: String(raw.name ?? '').trim() || 'Unknown food',
+    name: inferred.name || normalizedName || 'Unknown food',
     quantity,
-    unit: asUnit(raw.unit),
+    unit: asUnit(raw.unit || inferred.unit),
     calories_kcal: asNullableNumber(raw.calories_kcal),
     protein_g: asNullableNumber(raw.protein_g),
     carbs_g: asNullableNumber(raw.carbs_g),
@@ -273,14 +424,19 @@ function buildFoodExtractionPrompt(userText: string, hasImage: boolean): string 
   return [
     'You are a clinical dietitian and board-certified nutritional scientist.',
     'Return ONLY valid JSON.',
-    'Schema:',
-    FOOD_EXTRACTION_SCHEMA,
+    'Follow the provided response schema exactly.',
+    'Important: always extract quantity correctly.',
+    'For every item, return a structured object with name, quantity, unit, and all detailed nutrient fields you can estimate.',
+    'Return nutrient values for the extracted quantity of that item (not per 100g unless quantity is explicitly 100g).',
+    'If the user says 3 eggs, quantity must be 3 and unit must be piece.',
+    'Examples: "3 eggs" => quantity 3, unit "piece"; "1.5 cups rice" => quantity 1.5, unit "cup"; "250 ml milk" => quantity 250, unit "ml".',
     hasImage
       ? 'Analyze the attached meal image. When both text and image are provided, user text has priority for quantities.'
       : 'Infer reasonable nutrition values for common foods when exact labels are not provided.',
     'Populate every nutrient field in the schema when it can be reasonably estimated from standard nutrition references.',
     'Use null only when a value is genuinely not inferable with reasonable confidence.',
     'For countable foods like eggs, banana, roti, idli, use unit "piece".',
+    'Do not merge distinct foods into a single item when they were listed separately.',
     'Do not wrap JSON in markdown fences.',
     'FOOD INPUT START>>>',
     textBlock,
@@ -296,8 +452,19 @@ async function invokeGemini(env: Env, apiKey: string, prompt: string): Promise<{
       return await callGeminiApi(model, apiKey, prompt);
     } catch (error) {
       lastError = error;
+      if (isRecoverableModelOutputError(error)) {
+        try {
+          // Fallback schema reduces output size and avoids webhook 500 on long model outputs.
+          return await callGeminiApi(model, apiKey, prompt, undefined, {
+            responseSchema: FOOD_EXTRACTION_COMPACT_RESPONSE_SCHEMA,
+            maxOutputTokens: 10000,
+          });
+        } catch (fallbackError) {
+          lastError = fallbackError;
+        }
+      }
       if (!isModelFallbackError(error) || model === GEMINI_FALLBACK_MODEL) {
-        throw error;
+        throw lastError;
       }
     }
   }
@@ -317,8 +484,18 @@ async function invokeGeminiWithImage(
       return await callGeminiApi(model, apiKey, prompt, image);
     } catch (error) {
       lastError = error;
+      if (isRecoverableModelOutputError(error)) {
+        try {
+          return await callGeminiApi(model, apiKey, prompt, image, {
+            responseSchema: FOOD_EXTRACTION_COMPACT_RESPONSE_SCHEMA,
+            maxOutputTokens: 10000,
+          });
+        } catch (fallbackError) {
+          lastError = fallbackError;
+        }
+      }
       if (!isModelFallbackError(error) || model === GEMINI_FALLBACK_MODEL) {
-        throw error;
+        throw lastError;
       }
     }
   }
@@ -329,7 +506,7 @@ async function invokeGeminiWithImage(
 export async function callGemini(prompt: string, env: Env, image?: GeminiImageInput, _callType?: AiCallType): Promise<GeminiResponse> {
   let attempts = 0;
   const attemptedKeyIds = new Set<number>();
-  while (attempts < 3) {
+  while (attempts < 4) {
     const key = await pickGeminiKey(env, [...attemptedKeyIds]);
     if (!key) {
       throw new GeminiQuotaExhaustedError();
@@ -369,6 +546,10 @@ export async function callGemini(prompt: string, env: Env, image?: GeminiImageIn
         if (failCount > 5) {
           await deactivateKey(env, key.id);
         }
+        attempts += 1;
+        continue;
+      }
+      if (isRecoverableModelOutputError(error)) {
         attempts += 1;
         continue;
       }

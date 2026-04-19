@@ -1,8 +1,16 @@
 import { GoogleGenAI } from '@google/genai';
 import { getActiveGeminiKey } from '../data/db.js';
-import { type Env, type ParsedFoodItem } from '../types/index.js';
+import { type Env } from '../types/index.js';
 
 const DEFAULT_MODEL = 'gemini-3-flash-preview';
+
+interface ParsedFoodItem {
+  name: string;
+  calories: number | null;
+  protein_g: number | null;
+  carbs_g: number | null;
+  fat_g: number | null;
+}
 
 function normalizeNumber(value: unknown): number | null {
   const parsed = typeof value === 'number' ? value : Number.parseFloat(String(value));

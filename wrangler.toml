@@ -8,3 +8,12 @@ GEMINI_MODEL = "gemini-3-flash-preview"
 
 [observability]
 enabled = true
+
+[triggers]
+crons = [
+  "0 15 * * *",   # daily report (15:00 UTC)
+  "0 15 * * SUN", # weekly report (Sun 15:00 UTC)
+  "0 * * * *",    # meal gap check (hourly)
+  "30 18 * * *",  # reset daily AI counters (18:30 UTC = 00:00 IST)
+  "0 3 * * SUN",  # hard purge deleted (Sun 03:00 UTC)
+]

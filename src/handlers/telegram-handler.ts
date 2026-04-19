@@ -7,16 +7,149 @@ import {
   saveUser,
   softDeleteFoodForToday,
 } from '../data/db.js';
-import { buildInlineKeyboard, extractNutrition, formatPreview } from '../services/nutrition.js';
-import { answerCallbackQuery, sendTelegramMessage, sendTelegramMessageWithKeyboard } from '../services/telegram.js';
+import { extractFoodFromInput } from '../services/ai.js';
+import {
+  answerCallbackQuery,
+  editMessageReplyMarkup,
+  sendTelegramMessage,
+  sendTelegramMessageWithKeyboard,
+} from '../services/telegram.js';
 import {
   type Env,
+  type FoodItem,
+  type MealType,
   type OnboardingContext,
   type PendingLog,
   type TelegramCallbackQuery,
   type TelegramMessage,
   type TelegramUpdate,
 } from '../types/index.js';
+
+const timezoneChoices = [
+  { label: 'India', value: 'Asia/Kolkata' },
+  { label: 'USA (Eastern)', value: 'America/New_York' },
+  { label: 'UK', value: 'Europe/London' },
+  { label: 'UAE', value: 'Asia/Dubai' },
+] as const;
+
+function mapTimezoneInput(input: string): string {
+  const normalized = input.trim().toLowerCase();
+  if (!normalized) {
+    return '';
+  }
+
+  const direct = timezoneChoices.find((choice) => normalized === choice.label.toLowerCase());
+  if (direct) {
+    return direct.value;
+  }
+
+  if (normalized === 'usa' || normalized === 'us' || normalized === 'america') {
+    return 'America/New_York';
+  }
+
+  return input.trim();
+}
+
+function buildInlineKeyboard(sessionId: string): Record<string, unknown> {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'Save', callback_data: `save|${sessionId}` },
+        { text: 'Cancel', callback_data: `cancel|${sessionId}` },
+      ],
+    ],
+  };
+}
+
+function buildMealSelectionKeyboard(sessionId: string): Record<string, unknown> {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'Breakfast', callback_data: `meal|breakfast|${sessionId}` },
+        { text: 'Lunch', callback_data: `meal|lunch|${sessionId}` },
+      ],
+      [
+        { text: 'Dinner', callback_data: `meal|dinner|${sessionId}` },
+        { text: 'Others', callback_data: `meal|others|${sessionId}` },
+      ],
+      [{ text: 'Cancel', callback_data: `meal_cancel|${sessionId}` }],
+    ],
+  };
+}
+
+function buildTimezoneKeyboard(): Record<string, unknown> {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'India', callback_data: 'tz|india' },
+        { text: 'USA (Eastern)', callback_data: 'tz|usa_eastern' },
+      ],
+      [
+        { text: 'UK', callback_data: 'tz|uk' },
+        { text: 'UAE', callback_data: 'tz|uae' },
+      ],
+    ],
+  };
+}
+
+function timezoneFromToken(token: string): string | null {
+  switch (token) {
+    case 'india':
+      return 'Asia/Kolkata';
+    case 'usa_eastern':
+      return 'America/New_York';
+    case 'uk':
+      return 'Europe/London';
+    case 'uae':
+      return 'Asia/Dubai';
+    default:
+      return null;
+  }
+}
+
+function mealTypeLabel(mealType: MealType | null | undefined): string {
+  switch (mealType) {
+    case 'breakfast':
+      return 'Breakfast';
+    case 'lunch':
+      return 'Lunch';
+    case 'dinner':
+      return 'Dinner';
+    default:
+      return 'Others';
+  }
+}
+
+function formatPreview(items: FoodItem[], mealNotes?: string | null): string {
+  const lines = ['Review your extracted food log:'];
+  items.forEach((item, idx) => {
+    lines.push(
+      `${idx + 1}. ${item.quantity} ${item.unit} ${item.name} - ${item.calories_kcal ?? '?'} kcal | Protein ${item.protein_g ?? '?'}g | Carbs ${item.carbs_g ?? '?'}g | Fat ${item.fat_g ?? '?'}g`,
+    );
+  });
+
+  if (mealNotes) {
+    lines.push('');
+    lines.push(`Notes: ${mealNotes}`);
+  }
+
+  lines.push('');
+  const totals = items.reduce(
+    (acc, item) => ({
+      calories: acc.calories + (item.calories_kcal ?? 0),
+      protein: acc.protein + (item.protein_g ?? 0),
+      carbs: acc.carbs + (item.carbs_g ?? 0),
+      fat: acc.fat + (item.fat_g ?? 0),
+    }),
+    { calories: 0, protein: 0, carbs: 0, fat: 0 },
+  );
+  lines.push(
+    `Meal totals: ${Math.round(totals.calories)} kcal | Protein ${Math.round(totals.protein)}g | Carbs ${Math.round(totals.carbs)}g | Fat ${Math.round(totals.fat)}g`,
+  );
+  lines.push('Save this log?');
+
+  return lines.join('\n');
+}
 
 function buildTotalsMessage(rows: Awaited<ReturnType<typeof getTodayFoods>>): string {
   const totals = rows.reduce(
@@ -29,12 +162,26 @@ function buildTotalsMessage(rows: Awaited<ReturnType<typeof getTodayFoods>>): st
     { calories: 0, protein: 0, carbs: 0, fat: 0 },
   );
 
-  const lines = ["Today's logs:"];
-  rows.forEach((row, i) => {
-    lines.push(
-      `${i + 1}. ${row.food_name} - ${row.calories ?? '?'} kcal | P ${row.protein_g ?? '?'}g | C ${row.carbs_g ?? '?'}g | F ${row.fat_g ?? '?'}g`,
-    );
-  });
+  const groups: MealType[] = ['breakfast', 'lunch', 'dinner', 'others'];
+  const groupedRows = groups.map((meal) => ({
+    meal,
+    rows: rows.filter((row) => (row.meal_type ?? 'others') === meal),
+  }));
+
+  const lines = ["Today's food logs:"];
+  for (const group of groupedRows) {
+    if (group.rows.length === 0) {
+      continue;
+    }
+    lines.push('');
+    lines.push(`${mealTypeLabel(group.meal)}:`);
+    group.rows.forEach((row, index) => {
+      const quantityPrefix = row.quantity && row.unit ? `${row.quantity} ${row.unit} ` : '';
+      lines.push(
+        `${index + 1}. ${quantityPrefix}${row.food_name} - ${row.calories ?? '?'} kcal | Protein ${row.protein_g ?? '?'}g | Carbs ${row.carbs_g ?? '?'}g | Fat ${row.fat_g ?? '?'}g`,
+      );
+    });
+  }
 
   lines.push('');
   lines.push(
@@ -44,11 +191,79 @@ function buildTotalsMessage(rows: Awaited<ReturnType<typeof getTodayFoods>>): st
   return lines.join('\n');
 }
 
-async function handleStart(env: Env, message: TelegramMessage): Promise<void> {
-  const telegramId = String(message.from?.id ?? '');
-  const chatId = message.chat.id;
+function buildSavedMealMessage(pending: PendingLog): string {
+  const totalCalories = pending.items.reduce((acc, item) => acc + (item.calories_kcal ?? 0), 0);
 
-  await saveState(env, telegramId, 'idle', {
+  const lines = ['Meal saved successfully.', ''];
+  pending.items.forEach((item, index) => {
+    lines.push(`${index + 1}. ${item.quantity} ${item.unit} ${item.name}`);
+  });
+
+  lines.push('');
+  lines.push(`Saved total calories: ${Math.round(totalCalories)} kcal`);
+
+  return lines.join('\n');
+}
+
+function clearAwaitingLogText(context: OnboardingContext): OnboardingContext {
+  const { awaiting_log_text: _ignored, ...rest } = context;
+  return rest;
+}
+
+async function processLogTextWithMealSelection(env: Env, message: TelegramMessage, logText: string): Promise<void> {
+  const telegramId = String(message.from?.id ?? '');
+  const state = await getState(env, telegramId);
+
+  if (state.context.pending_meal_selection) {
+    await sendTelegramMessage(
+      env,
+      message.chat.id,
+      'A meal type selection is already pending. Please select one from the existing buttons first.',
+    );
+    return;
+  }
+  if (state.context.pending_log) {
+    await sendTelegramMessage(
+      env,
+      message.chat.id,
+      'You have a pending food log awaiting confirmation. Please save or cancel it first.',
+    );
+    return;
+  }
+
+  await sendTelegramMessage(env, message.chat.id, 'Processing your food details. Please wait...');
+  const extracted = await extractFoodFromInput(env, logText);
+  if (extracted.parsed.items.length === 0) {
+    await sendTelegramMessage(env, message.chat.id, 'I could not identify any food items. Please try /log again with more detail.');
+    return;
+  }
+
+  const sessionId = crypto.randomUUID();
+  const pendingLog: PendingLog = {
+    session_id: sessionId,
+    source_text: logText,
+    ai_raw_response: extracted.raw,
+    items: extracted.parsed.items,
+    meal_notes: extracted.parsed.meal_notes,
+  };
+
+  await saveState(env, telegramId, 'awaiting_food_input', {
+    pending_log: pendingLog,
+    pending_meal_selection: {
+      session_id: sessionId,
+      source_text: logText,
+    },
+  });
+  await sendTelegramMessageWithKeyboard(
+    env,
+    message.chat.id,
+    'Choose meal type to continue:',
+    buildMealSelectionKeyboard(sessionId),
+  );
+}
+
+async function startOnboarding(env: Env, telegramId: string, chatId: number): Promise<void> {
+  await saveState(env, telegramId, 'onboarding', {
     onboarding: {
       step: 'name',
       draft: {},
@@ -62,6 +277,32 @@ async function handleStart(env: Env, message: TelegramMessage): Promise<void> {
   );
 }
 
+async function handleStart(env: Env, message: TelegramMessage): Promise<void> {
+  const telegramId = String(message.from?.id ?? '');
+  const chatId = message.chat.id;
+  const userId = await getUserIdByTelegramId(env, telegramId);
+  const state = await getState(env, telegramId);
+
+  if (userId) {
+    if (state.state === 'onboarding' || state.context.onboarding) {
+      console.warn('existing user has onboarding state; normalizing to awaiting_food_input', { telegramId });
+    }
+
+    const hasPending = Boolean(state.context.pending_log);
+    await saveState(env, telegramId, 'awaiting_food_input', state.context);
+    await sendTelegramMessage(
+      env,
+      chatId,
+      hasPending
+        ? 'You are already set up. Your pending food confirmation is still active.'
+        : 'You are already set up. Send food text any time to log your meals.',
+    );
+    return;
+  }
+
+  await startOnboarding(env, telegramId, chatId);
+}
+
 async function handleOnboarding(
   env: Env,
   message: TelegramMessage,
@@ -73,28 +314,33 @@ async function handleOnboarding(
 
   const onboarding = state.context.onboarding;
   if (!onboarding) {
-    await saveState(env, telegramId, 'idle', {
-      onboarding: { step: 'name', draft: {} },
-    });
-    await sendTelegramMessage(env, chatId, "Let's begin. What name should I call you?");
+    await startOnboarding(env, telegramId, chatId);
     return;
   }
 
   if (onboarding.step === 'name') {
     const firstName = input || message.from?.first_name || 'User';
-    await saveState(env, telegramId, 'idle', {
+    await saveState(env, telegramId, 'onboarding', {
       onboarding: {
         step: 'timezone',
         draft: { ...onboarding.draft, first_name: firstName },
       },
     });
-    await sendTelegramMessage(env, chatId, 'Great. What is your timezone? (example: Asia/Kolkata)');
+    await sendTelegramMessageWithKeyboard(
+      env,
+      chatId,
+      [
+        'Great. Choose your timezone:',
+        'Tap one option below, or send a custom value like Asia/Kolkata.',
+      ].join('\n'),
+      buildTimezoneKeyboard(),
+    );
     return;
   }
 
   if (onboarding.step === 'timezone') {
-    const timezone = input;
-    await saveState(env, telegramId, 'idle', {
+    const timezone = mapTimezoneInput(input);
+    await saveState(env, telegramId, 'onboarding', {
       onboarding: {
         step: 'calorie_goal',
         draft: { ...onboarding.draft, timezone },
@@ -119,7 +365,15 @@ async function handleOnboarding(
     await sendTelegramMessage(
       env,
       chatId,
-      'Setup complete. Send food text like: 2 eggs scrambled + toast, and I will return nutrition breakdown.',
+      [
+        'Setup complete.',
+        '',
+        'Use /log to add a meal.',
+        'After /log, I will ask you to enter your meal text.',
+        'Example meal text: 2 eggs scrambled + toast.',
+        '',
+        'Use /today to see today\'s saved food logs and totals.',
+      ].join('\n'),
     );
   }
 }
@@ -134,17 +388,89 @@ async function handleFoodInput(env: Env, message: TelegramMessage): Promise<void
     return;
   }
 
-  const extracted = await extractNutrition(env, text);
+  const state = await getState(env, telegramId);
+  if (state.context.pending_meal_selection) {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      'Please select meal type from the buttons above before I process this log.',
+    );
+    return;
+  }
+
+  if (state.context.pending_log) {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      'You have a pending food log awaiting confirmation. Please save or cancel it first.',
+    );
+    return;
+  }
+
+  const extracted = await extractFoodFromInput(env, text);
+  if (extracted.parsed.items.length === 0) {
+    await sendTelegramMessage(env, chatId, 'I could not identify any food items. Please try again with more detail.');
+    return;
+  }
+
   const sessionId = crypto.randomUUID();
   const pendingLog: PendingLog = {
     session_id: sessionId,
     source_text: text,
     ai_raw_response: extracted.raw,
-    items: extracted.items,
+    items: extracted.parsed.items,
+    meal_notes: extracted.parsed.meal_notes,
   };
 
   await saveState(env, telegramId, 'awaiting_food_input', { pending_log: pendingLog });
-  await sendTelegramMessageWithKeyboard(env, chatId, formatPreview(extracted.items), buildInlineKeyboard(sessionId));
+  await sendTelegramMessageWithKeyboard(
+    env,
+    chatId,
+    formatPreview(extracted.parsed.items, extracted.parsed.meal_notes),
+    buildInlineKeyboard(sessionId),
+  );
+}
+
+async function handleLogCommand(env: Env, message: TelegramMessage): Promise<void> {
+  const text = (message.text || '').trim();
+  const logText = text.replace(/^\/log\s*/i, '').trim();
+  const telegramId = String(message.from?.id ?? '');
+  const state = await getState(env, telegramId);
+
+  if (state.context.pending_meal_selection) {
+    await sendTelegramMessage(
+      env,
+      message.chat.id,
+      'A meal type selection is already pending. Please select one from the existing buttons first.',
+    );
+    return;
+  }
+  if (state.context.pending_log) {
+    await sendTelegramMessage(
+      env,
+      message.chat.id,
+      'You have a pending food log awaiting confirmation. Please save or cancel it first.',
+    );
+    return;
+  }
+
+  if (!logText) {
+    await saveState(env, telegramId, 'awaiting_food_input', {
+      ...clearAwaitingLogText(state.context),
+      awaiting_log_text: true,
+    });
+    await sendTelegramMessage(
+      env,
+      message.chat.id,
+      [
+        'Please enter your meal text now.',
+        'Example: 2 eggs and toast',
+      ].join('\n'),
+    );
+    return;
+  }
+
+  await processLogTextWithMealSelection(env, message, logText);
 }
 
 async function handleToday(env: Env, message: TelegramMessage): Promise<void> {
@@ -192,13 +518,120 @@ async function handleDelete(env: Env, message: TelegramMessage, fullText: string
   await sendTelegramMessage(env, chatId, `Deleted (soft): ${deleted}`);
 }
 
+async function clearInlineKeyboard(env: Env, callback: TelegramCallbackQuery): Promise<void> {
+  const chatId = callback.message?.chat.id;
+  const messageId = callback.message?.message_id;
+  if (!chatId || !messageId) {
+    return;
+  }
+
+  try {
+    await editMessageReplyMarkup(env, chatId, messageId, { inline_keyboard: [] });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.toLowerCase().includes('message is not modified')) {
+      console.error('failed to clear reply markup', error);
+    }
+  }
+}
+
 async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): Promise<void> {
   const chatId = callback.message?.chat.id;
   const telegramId = String(callback.from.id);
   const data = callback.data || '';
-  const [action, sessionId] = data.split('|');
+  const [action, arg1, arg2] = data.split('|');
 
-  if (!chatId || !action || !sessionId) {
+  if (!chatId || !action) {
+    await answerCallbackQuery(env, callback.id, 'Invalid action.');
+    return;
+  }
+
+  if (action === 'meal_cancel') {
+    const sessionId = arg1;
+    const state = await getState(env, telegramId);
+    const pendingSelection = state.context.pending_meal_selection;
+    if (!sessionId || !pendingSelection || pendingSelection.session_id !== sessionId) {
+      await answerCallbackQuery(env, callback.id, 'This button is stale.');
+      await clearInlineKeyboard(env, callback);
+      return;
+    }
+    await answerCallbackQuery(env, callback.id, 'Cancelled.');
+    await clearInlineKeyboard(env, callback);
+    await saveState(env, telegramId, 'awaiting_food_input', {});
+    await sendTelegramMessage(env, chatId, 'Log cancelled. Send /log again when ready.');
+    return;
+  }
+
+  if (action === 'tz') {
+    const timezone = arg1 ? timezoneFromToken(arg1) : null;
+    if (!timezone) {
+      await answerCallbackQuery(env, callback.id, 'Invalid timezone selection.');
+      return;
+    }
+
+    const state = await getState(env, telegramId);
+    const onboarding = state.context.onboarding;
+    if (!onboarding || onboarding.step !== 'timezone') {
+      await answerCallbackQuery(env, callback.id, 'This selection is no longer active.');
+      await clearInlineKeyboard(env, callback);
+      return;
+    }
+
+    await answerCallbackQuery(env, callback.id, 'Timezone selected.');
+    await clearInlineKeyboard(env, callback);
+    await saveState(env, telegramId, 'onboarding', {
+      onboarding: {
+        step: 'calorie_goal',
+        draft: { ...onboarding.draft, timezone },
+      },
+    });
+    await sendTelegramMessage(env, chatId, 'What is your daily calorie goal? (example: 2000)');
+    return;
+  }
+
+  if (action === 'meal') {
+    const mealType = arg1 as MealType | undefined;
+    const sessionId = arg2;
+    if (!mealType || !sessionId || !['breakfast', 'lunch', 'dinner', 'others'].includes(mealType)) {
+      await answerCallbackQuery(env, callback.id, 'Invalid meal selection.');
+      return;
+    }
+
+    const state = await getState(env, telegramId);
+    const pendingSelection = state.context.pending_meal_selection;
+    const pending = state.context.pending_log;
+    if (!pendingSelection || pendingSelection.session_id !== sessionId) {
+      await answerCallbackQuery(env, callback.id, 'This button is stale.');
+      await clearInlineKeyboard(env, callback);
+      return;
+    }
+
+    if (!pending || pending.session_id !== sessionId) {
+      await answerCallbackQuery(env, callback.id, 'This log expired. Please send /log again.');
+      await clearInlineKeyboard(env, callback);
+      await saveState(env, telegramId, 'awaiting_food_input', {});
+      return;
+    }
+
+    await answerCallbackQuery(env, callback.id, 'Done.');
+    await clearInlineKeyboard(env, callback);
+    const pendingLog: PendingLog = {
+      ...pending,
+      meal_type: mealType,
+    };
+
+    await saveState(env, telegramId, 'awaiting_food_input', { pending_log: pendingLog });
+    await sendTelegramMessageWithKeyboard(
+      env,
+      chatId,
+      formatPreview(pendingLog.items, pendingLog.meal_notes),
+      buildInlineKeyboard(pendingLog.session_id),
+    );
+    return;
+  }
+
+  const sessionId = arg1;
+  if (!sessionId) {
     await answerCallbackQuery(env, callback.id, 'Invalid action.');
     return;
   }
@@ -208,22 +641,27 @@ async function handleCallbackQuery(env: Env, callback: TelegramCallbackQuery): P
 
   if (!pending || pending.session_id !== sessionId) {
     await answerCallbackQuery(env, callback.id, 'This button is stale.');
+    await clearInlineKeyboard(env, callback);
     await sendTelegramMessage(env, chatId, 'That action has expired. Please send your food text again.');
     return;
   }
 
   if (action === 'cancel') {
-    await saveState(env, telegramId, 'awaiting_food_input', {});
     await answerCallbackQuery(env, callback.id, 'Cancelled.');
+    await clearInlineKeyboard(env, callback);
+    await saveState(env, telegramId, 'awaiting_food_input', {});
     await sendTelegramMessage(env, chatId, 'Cancelled. Send a new food text when ready.');
     return;
   }
 
   if (action === 'save') {
+    await answerCallbackQuery(env, callback.id, 'Saving...');
+    await clearInlineKeyboard(env, callback);
+    await sendTelegramMessage(env, chatId, 'Saving your meal. Please wait...');
     await saveFoodLog(env, telegramId, pending);
     await saveState(env, telegramId, 'awaiting_food_input', {});
-    await answerCallbackQuery(env, callback.id, 'Saved.');
-    await sendTelegramMessage(env, chatId, 'Saved. Use /today to view totals.');
+    await sendTelegramMessage(env, chatId, buildSavedMealMessage(pending));
+    await sendTelegramMessage(env, chatId, 'Use /today to check today\'s full logs and totals.');
     return;
   }
 
@@ -252,6 +690,11 @@ export async function handleTelegramUpdate(env: Env, update: TelegramUpdate): Pr
     return;
   }
 
+  if (text.toLowerCase() === '/log' || text.toLowerCase().startsWith('/log ')) {
+    await handleLogCommand(env, message);
+    return;
+  }
+
   if (text === '/today') {
     await handleToday(env, message);
     return;
@@ -263,9 +706,22 @@ export async function handleTelegramUpdate(env: Env, update: TelegramUpdate): Pr
   }
 
   const telegramId = String(message.from.id);
+  const userId = await getUserIdByTelegramId(env, telegramId);
   const state = await getState(env, telegramId);
-  if (state.state !== 'awaiting_food_input') {
+
+  if (state.state === 'onboarding' || state.context.onboarding) {
     await handleOnboarding(env, message, state);
+    return;
+  }
+
+  if (!userId) {
+    await startOnboarding(env, telegramId, message.chat.id);
+    return;
+  }
+
+  if (state.context.awaiting_log_text) {
+    await saveState(env, telegramId, 'awaiting_food_input', clearAwaitingLogText(state.context));
+    await processLogTextWithMealSelection(env, message, text);
     return;
   }
 
