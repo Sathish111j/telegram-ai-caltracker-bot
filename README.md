@@ -14,7 +14,7 @@ AI-powered Telegram calorie and nutrition tracker running on Cloudflare Workers.
 
 Use either option below:
 
-1. Open bot link: `https://t.me/DIETTRACKERAIBOT`
+1. Open bot link: [Open Telegram Bot](https://t.me/DIETTRACKERAIBOT)
      (or)
 2. Scan QR code:
 
