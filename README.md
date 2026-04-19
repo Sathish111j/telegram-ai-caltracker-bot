@@ -17,7 +17,7 @@ Use either option below:
 1. Open bot link: `https://t.me/DIETTRACKERAIBOT`
 2. Scan QR code:
 
-![Telegram Bot QR](docs/images/telegram-bot-qr.png)
+<img src="docs/images/telegram-bot-qr.png" width="200"/>
 
 Place your QR image at `docs/images/telegram-bot-qr.png` so it renders on GitHub.
 
