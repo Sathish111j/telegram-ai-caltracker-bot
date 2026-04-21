@@ -20,12 +20,15 @@ model User {
   first_name   String?
   timezone     String?
   calorie_goal Int?
+
+  ai_calls_today Int    @default(0)
   created_at   DateTime @default(now())
   updated_at   DateTime @updatedAt
 
   food_logs FoodLog[]
 
   @@map("users")
+  @@index([ai_calls_today])
 }
 
 model ConversationState {
@@ -39,15 +42,19 @@ model ConversationState {
 }
 
 model GeminiKey {
-  id         Int      @id @default(autoincrement())
-  label      String
-  project_id String?
-  api_key    String
-  is_active  Boolean  @default(true)
-  created_at DateTime @default(now())
-  updated_at DateTime @updatedAt
+  id              Int       @id @default(autoincrement())
+  label           String
+  project_id      String?
+  api_key         String
+  is_active       Boolean   @default(true)
+  last_used_at    DateTime?
+  exhausted_until DateTime?
+  fail_count      Int       @default(0)
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
 
   @@map("gemini_keys")
+  @@index([is_active, exhausted_until, last_used_at])
 }
 
 model FoodLog {
@@ -66,6 +73,7 @@ model FoodLog {
   food_items FoodItem[]
 
   @@index([user_id, log_date])
+  @@index([created_at])
   @@map("food_logs")
 }
 
@@ -124,4 +132,15 @@ model FoodItem {
 
   @@index([food_log_id])
   @@map("food_items")
+}
+
+model ReportSendLog {
+  id          Int      @id @default(autoincrement())
+  telegram_id String
+  report_type String
+  sent_on     DateTime @db.Date
+  created_at  DateTime @default(now())
+
+  @@index([telegram_id, report_type, sent_on])
+  @@map("report_send_log")
 }

@@ -1,8 +1,11 @@
+import { type Sql } from 'postgres';
+
 export interface Env {
   DATABASE_URL?: string;
   GEMINI_MODEL?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
+  sql?: Sql;
 }
 
 export interface TelegramMessage {
@@ -123,7 +126,8 @@ export interface OnboardingContext {
     session_id: string;
     source_text: string;
   };
-  awaiting_log_text?: boolean;
+  pending_source_text?: string;
+  selected_meal_type?: MealType;
 }
 
 export interface ConversationState {
@@ -140,6 +144,7 @@ export interface TodayFoodRow {
   protein_g: number | null;
   carbs_g: number | null;
   fat_g: number | null;
+  created_at?: string;
 }
 
 export interface GeminiKeyRecord {

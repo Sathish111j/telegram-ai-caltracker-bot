@@ -1,6 +1,9 @@
 import { type FoodItem } from '../types/index.js';
 
-const NUMERIC_NUTRIENT_KEYS: Array<keyof FoodItem> = [
+/**
+ * Nutrients that scale linearly with the quantity of food.
+ */
+export const SCALABLE_NUTRIENT_KEYS: Array<keyof FoodItem> = [
   'calories_kcal',
   'protein_g',
   'carbs_g',
@@ -33,21 +36,31 @@ const NUMERIC_NUTRIENT_KEYS: Array<keyof FoodItem> = [
   'vitamin_b6_mg',
   'vitamin_b9_mcg',
   'vitamin_b12_mcg',
-  'glycemic_index',
   'glycemic_load',
   'omega3_g',
   'omega6_g',
   'water_content_g',
 ];
 
+/**
+ * All numeric nutrient-related keys, including those that don't scale (like GI).
+ */
+export const ALL_NUMERIC_NUTRIENT_KEYS: Array<keyof FoodItem> = [
+  ...SCALABLE_NUTRIENT_KEYS,
+  'glycemic_index',
+];
+
 export function rescaleNutrients(item: FoodItem, newQuantity: number): FoodItem {
+  if (!item.quantity || item.quantity <= 0) {
+    return { ...item, quantity: newQuantity };
+  }
   const factor = newQuantity / item.quantity;
   const next: FoodItem = { ...item, quantity: newQuantity };
 
-  for (const key of NUMERIC_NUTRIENT_KEYS) {
+  for (const key of SCALABLE_NUTRIENT_KEYS) {
     const value = next[key];
     if (typeof value === 'number') {
-      (next[key] as number) = Number((value * factor).toFixed(2));
+      (next[key] as number) = Math.round(value * factor * 100) / 100;
     }
   }
 

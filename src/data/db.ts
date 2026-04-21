@@ -10,117 +10,50 @@ import {
   type TodayFoodRow,
 } from '../types/index.js';
 
-let db: Sql | null = null;
-// Schema metadata is cached per isolate lifetime; deploy/restart refreshes it.
-const tableExistsCache = new Map<string, Promise<boolean>>();
-const columnExistsCache = new Map<string, Promise<boolean>>();
-const detailedFoodItemColumns = [
-  'quantity',
-  'unit',
-  'fiber_g',
-  'sugar_g',
-  'net_carbs_g',
-  'saturated_fat_g',
-  'trans_fat_g',
-  'monounsaturated_fat_g',
-  'polyunsaturated_fat_g',
-  'cholesterol_mg',
-  'sodium_mg',
-  'potassium_mg',
-  'calcium_mg',
-  'iron_mg',
-  'magnesium_mg',
-  'phosphorus_mg',
-  'zinc_mg',
-  'selenium_mcg',
-  'vitamin_a_mcg',
-  'vitamin_c_mg',
-  'vitamin_d_mcg',
-  'vitamin_e_mg',
-  'vitamin_k_mcg',
-  'vitamin_b1_mg',
-  'vitamin_b2_mg',
-  'vitamin_b3_mg',
-  'vitamin_b5_mg',
-  'vitamin_b6_mg',
-  'vitamin_b9_mcg',
-  'vitamin_b12_mcg',
-  'glycemic_index',
-  'glycemic_load',
-  'omega3_g',
-  'omega6_g',
-  'water_content_g',
-  'confidence_score',
-  'notes',
-] as const;
-
 function getDb(env: Env): Sql {
+  if (env.sql) {
+    return env.sql;
+  }
+
   if (!env.DATABASE_URL) {
     throw new Error('Missing DATABASE_URL secret.');
   }
 
-  if (!db) {
-    db = postgres(env.DATABASE_URL, {
-      max: 1,
-      prepare: false,
-      idle_timeout: 20,
-      connect_timeout: 10,
-    });
+  return postgres(env.DATABASE_URL, {
+    max: 1,
+    prepare: false,
+    idle_timeout: 20,
+    connect_timeout: 10,
+  });
+}
+
+/**
+ * High-speed optimization: Combines user profile and conversation state lookups into one hit.
+ */
+export async function getUserAndState(env: Env, telegramId: string): Promise<{ 
+  user: { id: number, first_name: string | null, timezone: string | null, calorie_goal: number | null } | null,
+  state: ConversationState 
+}> {
+  const sql = getDb(env);
+  const rows = await sql<any[]>`
+    select 
+      u.id, u.first_name, u.timezone, u.calorie_goal,
+      cs.state, cs.context
+    from users u
+    full outer join conversation_state cs on cs.telegram_id = u.telegram_id
+    where u.telegram_id = ${telegramId} or cs.telegram_id = ${telegramId}
+    limit 1
+  `;
+
+  if (rows.length === 0) {
+    return { user: null, state: { state: 'idle', context: {} } };
   }
 
-  return db;
-}
-
-function tableCacheKey(tableName: string): string {
-  return tableName.toLowerCase();
-}
-
-function columnCacheKey(tableName: string, columnName: string): string {
-  return `${tableName.toLowerCase()}.${columnName.toLowerCase()}`;
-}
-
-async function hasTable(env: Env, tableName: string): Promise<boolean> {
-  const key = tableCacheKey(tableName);
-  if (!tableExistsCache.has(key)) {
-    const sql = getDb(env);
-    const promise = sql<{ exists: boolean }[]>`
-        select exists (
-          select 1
-          from information_schema.tables
-          where table_schema = 'public'
-            and table_name = ${tableName}
-        ) as exists
-      `.then((rows) => rows[0]?.exists ?? false);
-    promise.catch(() => tableExistsCache.delete(key));
-    tableExistsCache.set(key, promise);
-  }
-
-  return tableExistsCache.get(key) as Promise<boolean>;
-}
-
-async function hasColumn(env: Env, tableName: string, columnName: string): Promise<boolean> {
-  const key = columnCacheKey(tableName, columnName);
-  if (!columnExistsCache.has(key)) {
-    const sql = getDb(env);
-    const promise = sql<{ exists: boolean }[]>`
-        select exists (
-          select 1
-          from information_schema.columns
-          where table_schema = 'public'
-            and table_name = ${tableName}
-            and column_name = ${columnName}
-        ) as exists
-      `.then((rows) => rows[0]?.exists ?? false);
-    promise.catch(() => columnExistsCache.delete(key));
-    columnExistsCache.set(key, promise);
-  }
-
-  return columnExistsCache.get(key) as Promise<boolean>;
-}
-
-async function supportsDetailedFoodItemStorage(env: Env): Promise<boolean> {
-  const checks = await Promise.all(detailedFoodItemColumns.map((columnName) => hasColumn(env, 'food_items', columnName)));
-  return checks.every(Boolean);
+  const row = rows[0];
+  return {
+    user: row.id ? { id: row.id, first_name: row.first_name, timezone: row.timezone, calorie_goal: row.calorie_goal } : null,
+    state: { state: row.state || 'idle', context: row.context || {} }
+  };
 }
 
 export async function getState(env: Env, telegramId: string): Promise<ConversationState> {
@@ -198,76 +131,40 @@ export async function getActiveGeminiKey(env: Env): Promise<string> {
 export async function pickGeminiKey(env: Env, attemptedKeyIds: number[]): Promise<GeminiKeyRecord | null> {
   const sql = getDb(env);
   const excludeIds = attemptedKeyIds.length ? attemptedKeyIds : [-1];
-  const hasExhaustedUntil = await hasColumn(env, 'gemini_keys', 'exhausted_until');
-  const hasLastUsedAt = await hasColumn(env, 'gemini_keys', 'last_used_at');
 
-  const rows = hasExhaustedUntil && hasLastUsedAt
-    ? await sql<GeminiKeyRecord[]>`
-        select id, label, api_key
-        from gemini_keys
-        where is_active = true
-          and id not in ${sql(excludeIds)}
-          and (exhausted_until is null or exhausted_until <= now())
-        order by last_used_at asc nulls first, id asc
-        limit 1
-      `
-    : await sql<GeminiKeyRecord[]>`
-        select id, label, api_key
-        from gemini_keys
-        where is_active = true
-          and id not in ${sql(excludeIds)}
-        order by id asc
-        limit 1
-      `;
+  const rows = await sql<GeminiKeyRecord[]>`
+    select id, label, api_key
+    from gemini_keys
+    where is_active = true
+      and id not in ${sql(excludeIds)}
+      and (exhausted_until is null or exhausted_until <= now())
+    order by last_used_at asc nulls first, id asc
+    limit 1
+  `;
 
   return rows[0] ?? null;
 }
 
 export async function touchGeminiKey(env: Env, keyId: number): Promise<void> {
   const sql = getDb(env);
-  const hasLastUsedAt = await hasColumn(env, 'gemini_keys', 'last_used_at');
-
-  if (hasLastUsedAt) {
-    await sql`
-      update gemini_keys
-      set last_used_at = now(), updated_at = now()
-      where id = ${keyId}
-    `;
-    return;
-  }
-
   await sql`
     update gemini_keys
-    set updated_at = now()
+    set last_used_at = now(), updated_at = now()
     where id = ${keyId}
   `;
 }
 
 export async function markKeyExhausted(env: Env, keyId: number): Promise<void> {
   const sql = getDb(env);
-  const hasExhaustedUntil = await hasColumn(env, 'gemini_keys', 'exhausted_until');
-
-  if (hasExhaustedUntil) {
-    await sql`
-      update gemini_keys
-      set exhausted_until = now() + interval '1 hour', updated_at = now()
-      where id = ${keyId}
-    `;
-    return;
-  }
-
-  await touchGeminiKey(env, keyId);
+  await sql`
+    update gemini_keys
+    set exhausted_until = now() + interval '1 hour', updated_at = now()
+    where id = ${keyId}
+  `;
 }
 
 export async function incrementKeyFailCount(env: Env, keyId: number): Promise<number> {
   const sql = getDb(env);
-  const hasFailCount = await hasColumn(env, 'gemini_keys', 'fail_count');
-
-  if (!hasFailCount) {
-    await touchGeminiKey(env, keyId);
-    return 1;
-  }
-
   const rows = await sql<{ fail_count: number }[]>`
     update gemini_keys
     set fail_count = coalesce(fail_count, 0) + 1,
@@ -290,8 +187,11 @@ export async function deactivateKey(env: Env, keyId: number): Promise<void> {
 
 export async function saveFoodLog(env: Env, telegramId: string, pendingLog: PendingLog): Promise<void> {
   const sql = getDb(env);
-  const userId = await getUserIdByTelegramId(env, telegramId);
-  const detailedStorageAvailable = await supportsDetailedFoodItemStorage(env);
+  const userRows = await sql<{ id: number; timezone: string }[]>`
+    select id, timezone from users where telegram_id = ${telegramId} limit 1
+  `;
+  const userId = userRows[0]?.id;
+  const timezone = userRows[0]?.timezone || 'UTC';
 
   if (!userId) {
     throw new Error('User profile not found. Use /start first.');
@@ -299,9 +199,11 @@ export async function saveFoodLog(env: Env, telegramId: string, pendingLog: Pend
 
   await sql.begin(async (transaction) => {
     const txn = transaction as unknown as Sql;
+    const now = new Date();
+
     const inserted = await txn<{ id: number }[]>`
       insert into food_logs (user_id, session_id, log_date, meal_type, ai_raw_response, confirmed, is_deleted, created_at, updated_at)
-      values (${userId}, ${pendingLog.session_id}, current_date, ${pendingLog.meal_type ?? null}, ${pendingLog.ai_raw_response}, true, false, now(), now())
+      values (${userId}, ${pendingLog.session_id}, (now() at time zone ${timezone})::date, ${pendingLog.meal_type ?? null}, ${pendingLog.ai_raw_response}, true, false, ${now}, ${now})
       returning id
     `;
 
@@ -310,160 +212,74 @@ export async function saveFoodLog(env: Env, telegramId: string, pendingLog: Pend
       throw new Error('Failed to create food log.');
     }
 
-    for (const item of pendingLog.items) {
-      const rawItem = JSON.parse(JSON.stringify(item));
+    const itemsToInsert = pendingLog.items.map((item) => ({
+      food_log_id: foodLogId,
+      name: item.name,
+      quantity: item.quantity,
+      unit: item.unit,
+      calories: item.calories_kcal,
+      protein_g: item.protein_g,
+      carbs_g: item.carbs_g,
+      fat_g: item.fat_g,
+      fiber_g: item.fiber_g,
+      sugar_g: item.sugar_g,
+      net_carbs_g: item.net_carbs_g,
+      saturated_fat_g: item.saturated_fat_g,
+      trans_fat_g: item.trans_fat_g,
+      monounsaturated_fat_g: item.monounsaturated_fat_g,
+      polyunsaturated_fat_g: item.polyunsaturated_fat_g,
+      cholesterol_mg: item.cholesterol_mg,
+      sodium_mg: item.sodium_mg,
+      potassium_mg: item.potassium_mg,
+      calcium_mg: item.calcium_mg,
+      iron_mg: item.iron_mg,
+      magnesium_mg: item.magnesium_mg,
+      phosphorus_mg: item.phosphorus_mg,
+      zinc_mg: item.zinc_mg,
+      selenium_mcg: item.selenium_mcg,
+      vitamin_a_mcg: item.vitamin_a_mcg,
+      vitamin_c_mg: item.vitamin_c_mg,
+      vitamin_d_mcg: item.vitamin_d_mcg,
+      vitamin_e_mg: item.vitamin_e_mg,
+      vitamin_k_mcg: item.vitamin_k_mcg,
+      vitamin_b1_mg: item.vitamin_b1_mg,
+      vitamin_b2_mg: item.vitamin_b2_mg,
+      vitamin_b3_mg: item.vitamin_b3_mg,
+      vitamin_b5_mg: item.vitamin_b5_mg,
+      vitamin_b6_mg: item.vitamin_b6_mg,
+      vitamin_b9_mcg: item.vitamin_b9_mcg,
+      vitamin_b12_mcg: item.vitamin_b12_mcg,
+      glycemic_index: item.glycemic_index,
+      glycemic_load: item.glycemic_load,
+      omega3_g: item.omega3_g,
+      omega6_g: item.omega6_g,
+      water_content_g: item.water_content_g,
+      confidence_score: item.confidence_score,
+      notes: item.notes,
+      raw_json: txn.json(item),
+      data_source: 'ai_text',
+      is_deleted: false,
+      created_at: now,
+      updated_at: now,
+    }));
 
-      if (detailedStorageAvailable) {
-        await txn`
-          insert into food_items (
-            food_log_id,
-            name,
-            quantity,
-            unit,
-            calories,
-            protein_g,
-            carbs_g,
-            fat_g,
-            fiber_g,
-            sugar_g,
-            net_carbs_g,
-            saturated_fat_g,
-            trans_fat_g,
-            monounsaturated_fat_g,
-            polyunsaturated_fat_g,
-            cholesterol_mg,
-            sodium_mg,
-            potassium_mg,
-            calcium_mg,
-            iron_mg,
-            magnesium_mg,
-            phosphorus_mg,
-            zinc_mg,
-            selenium_mcg,
-            vitamin_a_mcg,
-            vitamin_c_mg,
-            vitamin_d_mcg,
-            vitamin_e_mg,
-            vitamin_k_mcg,
-            vitamin_b1_mg,
-            vitamin_b2_mg,
-            vitamin_b3_mg,
-            vitamin_b5_mg,
-            vitamin_b6_mg,
-            vitamin_b9_mcg,
-            vitamin_b12_mcg,
-            glycemic_index,
-            glycemic_load,
-            omega3_g,
-            omega6_g,
-            water_content_g,
-            confidence_score,
-            notes,
-            raw_json,
-            data_source,
-            is_deleted,
-            created_at,
-            updated_at
-          )
-          values (
-            ${foodLogId},
-            ${item.name},
-            ${item.quantity},
-            ${item.unit},
-            ${item.calories_kcal},
-            ${item.protein_g},
-            ${item.carbs_g},
-            ${item.fat_g},
-            ${item.fiber_g},
-            ${item.sugar_g},
-            ${item.net_carbs_g},
-            ${item.saturated_fat_g},
-            ${item.trans_fat_g},
-            ${item.monounsaturated_fat_g},
-            ${item.polyunsaturated_fat_g},
-            ${item.cholesterol_mg},
-            ${item.sodium_mg},
-            ${item.potassium_mg},
-            ${item.calcium_mg},
-            ${item.iron_mg},
-            ${item.magnesium_mg},
-            ${item.phosphorus_mg},
-            ${item.zinc_mg},
-            ${item.selenium_mcg},
-            ${item.vitamin_a_mcg},
-            ${item.vitamin_c_mg},
-            ${item.vitamin_d_mcg},
-            ${item.vitamin_e_mg},
-            ${item.vitamin_k_mcg},
-            ${item.vitamin_b1_mg},
-            ${item.vitamin_b2_mg},
-            ${item.vitamin_b3_mg},
-            ${item.vitamin_b5_mg},
-            ${item.vitamin_b6_mg},
-            ${item.vitamin_b9_mcg},
-            ${item.vitamin_b12_mcg},
-            ${item.glycemic_index},
-            ${item.glycemic_load},
-            ${item.omega3_g},
-            ${item.omega6_g},
-            ${item.water_content_g},
-            ${item.confidence_score},
-            ${item.notes},
-            ${txn.json(rawItem)},
-            'ai_text',
-            false,
-            now(),
-            now()
-          )
-        `;
-        continue;
-      }
-
-      await txn`
-          insert into food_items (food_log_id, name, calories, protein_g, carbs_g, fat_g, raw_json, data_source, is_deleted, created_at, updated_at)
-          values (
-            ${foodLogId},
-            ${item.name},
-            ${item.calories_kcal},
-            ${item.protein_g},
-            ${item.carbs_g},
-            ${item.fat_g},
-            ${txn.json(rawItem)},
-            'ai_text',
-            false,
-            now(),
-            now()
-          )
-        `;
-    }
+    await txn`
+      insert into food_items ${txn(itemsToInsert)}
+    `;
   });
 }
 
 export async function getTodayFoods(env: Env, userId: number): Promise<TodayFoodRow[]> {
   const sql = getDb(env);
-  const hasQuantity = await hasColumn(env, 'food_items', 'quantity');
-  const hasUnit = await hasColumn(env, 'food_items', 'unit');
-
-  if (hasQuantity && hasUnit) {
-    return sql<TodayFoodRow[]>`
-      select fi.name as food_name, fl.meal_type, fi.quantity, fi.unit, fi.calories, fi.protein_g, fi.carbs_g, fi.fat_g
-      from food_logs fl
-      join food_items fi on fi.food_log_id = fl.id
-      where fl.user_id = ${userId}
-        and fl.log_date = current_date
-        and fl.confirmed = true
-        and fl.is_deleted = false
-        and fi.is_deleted = false
-      order by fi.created_at asc
-    `;
-  }
+  const userRows = await sql<{ timezone: string }[]>`select timezone from users where id = ${userId} limit 1`;
+  const timezone = userRows[0]?.timezone || 'UTC';
 
   return sql<TodayFoodRow[]>`
-    select fi.name as food_name, fl.meal_type, null::double precision as quantity, null::text as unit, fi.calories, fi.protein_g, fi.carbs_g, fi.fat_g
+    select fi.name as food_name, fl.meal_type, fi.quantity, fi.unit, fi.calories, fi.protein_g, fi.carbs_g, fi.fat_g, fi.created_at
     from food_logs fl
     join food_items fi on fi.food_log_id = fl.id
     where fl.user_id = ${userId}
-      and fl.log_date = current_date
+      and fl.log_date = (now() at time zone ${timezone})::date
       and fl.confirmed = true
       and fl.is_deleted = false
       and fi.is_deleted = false
@@ -475,12 +291,15 @@ export async function softDeleteFoodForToday(env: Env, userId: number, namePart:
   const sql = getDb(env);
   return sql.begin(async (transaction) => {
     const txn = transaction as unknown as Sql;
+    const userRows = await txn<{ timezone: string }[]>`select timezone from users where id = ${userId} limit 1`;
+    const timezone = userRows[0]?.timezone || 'UTC';
+
     const targetRows = await txn<{ food_item_id: number; food_log_id: number; food_name: string }[]>`
       select fi.id as food_item_id, fl.id as food_log_id, fi.name as food_name
       from food_items fi
       join food_logs fl on fl.id = fi.food_log_id
       where fl.user_id = ${userId}
-        and fl.log_date = current_date
+        and fl.log_date = (now() at time zone ${timezone})::date
         and fl.confirmed = true
         and fl.is_deleted = false
         and fi.is_deleted = false
@@ -520,10 +339,6 @@ export async function softDeleteFoodForToday(env: Env, userId: number, namePart:
 }
 
 export async function getDueDailyReportTelegramIds(env: Env): Promise<string[]> {
-  if (!(await hasTable(env, 'report_send_log'))) {
-    return [];
-  }
-
   const sql = getDb(env);
   const rows = await sql<{ telegram_id: string }[]>`
     select u.telegram_id
@@ -533,12 +348,7 @@ export async function getDueDailyReportTelegramIds(env: Env): Promise<string[]> 
       from report_send_log r
       where r.telegram_id = u.telegram_id
         and r.report_type = 'daily'
-        and r.sent_on = (now() at time zone (
-          case
-            when exists (select 1 from pg_timezone_names tzn where tzn.name = u.timezone) then u.timezone
-            else 'UTC'
-          end
-        ))::date
+        and r.sent_on = (now() at time zone coalesce(u.timezone, 'UTC'))::date
     )
     order by u.id asc
   `;
@@ -547,10 +357,6 @@ export async function getDueDailyReportTelegramIds(env: Env): Promise<string[]> 
 }
 
 export async function getDueWeeklyReportTelegramIds(env: Env): Promise<string[]> {
-  if (!(await hasTable(env, 'report_send_log'))) {
-    return [];
-  }
-
   const sql = getDb(env);
   const rows = await sql<{ telegram_id: string }[]>`
     select u.telegram_id
@@ -560,12 +366,7 @@ export async function getDueWeeklyReportTelegramIds(env: Env): Promise<string[]>
       from report_send_log r
       where r.telegram_id = u.telegram_id
         and r.report_type = 'weekly'
-        and date_trunc('week', r.sent_on::timestamp) = date_trunc('week', ((now() at time zone (
-          case
-            when exists (select 1 from pg_timezone_names tzn where tzn.name = u.timezone) then u.timezone
-            else 'UTC'
-          end
-        ))::date)::timestamp)
+        and date_trunc('week', r.sent_on::timestamp) = date_trunc('week', ((now() at time zone coalesce(u.timezone, 'UTC'))::date)::timestamp)
     )
     order by u.id asc
   `;
@@ -638,12 +439,15 @@ export async function getWeeklySummary(env: Env, telegramId: string): Promise<Su
   }
 
   const sql = getDb(env);
+  const userRows = await sql<{ timezone: string }[]>`select timezone from users where id = ${userId} limit 1`;
+  const timezone = userRows[0]?.timezone || 'UTC';
+
   const rows = await sql<TodayFoodRow[]>`
     select fi.name as food_name, fi.calories, fi.protein_g, fi.carbs_g, fi.fat_g
     from food_logs fl
     join food_items fi on fi.food_log_id = fl.id
     where fl.user_id = ${userId}
-      and fl.log_date >= current_date - interval '6 day'
+      and fl.log_date >= (now() at time zone ${timezone})::date - interval '6 day'
       and fl.confirmed = true
       and fl.is_deleted = false
       and fi.is_deleted = false
@@ -654,22 +458,13 @@ export async function getWeeklySummary(env: Env, telegramId: string): Promise<Su
 }
 
 export async function markReportSent(env: Env, telegramId: string, reportType: ReportType): Promise<void> {
-  if (!(await hasTable(env, 'report_send_log'))) {
-    return;
-  }
-
   const sql = getDb(env);
   await sql`
     insert into report_send_log (telegram_id, report_type, sent_on, created_at)
     select
       u.telegram_id,
       ${reportType},
-      (now() at time zone (
-        case
-          when exists (select 1 from pg_timezone_names tzn where tzn.name = u.timezone) then u.timezone
-          else 'UTC'
-        end
-      ))::date,
+      (now() at time zone coalesce(u.timezone, 'UTC'))::date,
       now()
     from users u
     where u.telegram_id = ${telegramId}
@@ -678,17 +473,13 @@ export async function markReportSent(env: Env, telegramId: string, reportType: R
 }
 
 export async function resetDailyAiCounters(env: Env): Promise<number> {
-  if (!(await hasColumn(env, 'users', 'ai_calls_today'))) {
-    return 0;
-  }
-
   const sql = getDb(env);
   const rows = await sql<{ count: number }[]>`
     with updated as (
       update users
       set ai_calls_today = 0,
           updated_at = now()
-      where coalesce(ai_calls_today, 0) <> 0
+      where ai_calls_today <> 0
       returning 1
     )
     select count(*)::int as count
@@ -704,10 +495,6 @@ export async function hardPurgeDeleted(
   const sql = getDb(env);
 
   const purgeTable = async (tableName: 'users' | 'food_logs' | 'food_items' | 'supplement_logs'): Promise<number> => {
-    if (!(await hasTable(env, tableName)) || !(await hasColumn(env, tableName, 'is_deleted'))) {
-      return 0;
-    }
-
     const rows = await sql<{ count: number }[]>`
       with deleted as (
         delete from ${sql(tableName)}
