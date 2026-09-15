@@ -9,11 +9,13 @@ import {
   softDeleteFoodItemById,
 } from '../data/db.js';
 import { extractFoodFromInput, GeminiQuotaExhaustedError, GeminiTimeoutError } from '../services/ai.js';
+import { buildTotalsMessage, formatPreview, mealTypeLabel } from '../services/format.js';
 import { sanitizeInput } from '../services/security.js';
 import {
   answerCallbackQuery,
   downloadTelegramImage,
   editMessageReplyMarkup,
+  editMessageText,
   escapeMarkdown,
   getFile,
   sendChatAction,
@@ -23,7 +25,6 @@ import {
 import {
   type ConversationState,
   type Env,
-  type FoodItem,
   type MealType,
   type PendingImage,
   type PendingLog,
@@ -31,7 +32,6 @@ import {
   type TelegramMessage,
   type TelegramUpdate,
   type TodayFoodMatch,
-  type TodayFoodRow,
 } from '../types/index.js';
 
 const timezoneChoices = [
@@ -45,6 +45,8 @@ const HELP_TEXT = [
   '*NutriBot — what I can do:*',
   '',
   '🍽️ Send a text description or a photo of a meal any time to log it.',
+  '⚡ *Skip the meal-type tap* by starting with it: `breakfast 2 eggs and toast`,',
+  '   `lunch chicken rice`, `dinner`, `snack` all work.',
   '/log <meal> — log a meal in one message, e.g. `/log 2 eggs and toast`',
   '/log — guided logging: pick a meal type first, then describe it',
   '/today — see everything logged today, with totals',
@@ -56,6 +58,29 @@ const HELP_TEXT = [
 
 function isCommand(loweredText: string, command: string): boolean {
   return loweredText === command || loweredText.startsWith(`${command} `);
+}
+
+const MEAL_TYPE_PREFIXES: Array<{ pattern: RegExp; mealType: MealType }> = [
+  { pattern: /^breakfast\b[:,-]?\s*/i, mealType: 'breakfast' },
+  { pattern: /^lunch\b[:,-]?\s*/i, mealType: 'lunch' },
+  { pattern: /^dinner\b[:,-]?\s*/i, mealType: 'dinner' },
+  { pattern: /^(?:snacks?|others?)\b[:,-]?\s*/i, mealType: 'others' },
+];
+
+/**
+ * Lets a message like "breakfast 2 eggs and toast" skip the meal-type
+ * keyboard entirely — the explicit tap-through flow remains the default for
+ * everyone who doesn't use this shorthand.
+ */
+function extractMealTypePrefix(text: string): { mealType: MealType; rest: string } | null {
+  for (const { pattern, mealType } of MEAL_TYPE_PREFIXES) {
+    const match = text.match(pattern);
+    if (match) {
+      const rest = text.slice(match[0].length).trim();
+      if (rest) return { mealType, rest };
+    }
+  }
+  return null;
 }
 
 /** Maps free-text timezone input to an IANA zone, or null if unrecognized. */
@@ -135,15 +160,6 @@ function timezoneFromToken(token: string): string | null {
   }
 }
 
-function mealTypeLabel(mealType: MealType | null | undefined): string {
-  switch (mealType) {
-    case 'breakfast': return 'Breakfast';
-    case 'lunch': return 'Lunch';
-    case 'dinner': return 'Dinner';
-    default: return 'Snacks / Others';
-  }
-}
-
 function friendlyErrorMessage(error: unknown): string {
   if (error instanceof GeminiQuotaExhaustedError) {
     return "I'm having trouble reaching the AI service right now — please try again in a few minutes.";
@@ -152,66 +168,6 @@ function friendlyErrorMessage(error: unknown): string {
     return 'That took too long to process — please try again.';
   }
   return 'Something went wrong while processing that — please try again in a moment.';
-}
-
-function formatPreview(items: FoodItem[], mealNotes?: string | null): string {
-  const lines = ['🥗 *Nutrient Breakdown:*'];
-  items.forEach((item, idx) => {
-    lines.push(
-      `${idx + 1}. ${item.quantity} ${item.unit} ${escapeMarkdown(item.name)} - ${item.calories_kcal ?? '?'} kcal | P ${item.protein_g ?? '?'}g | C ${item.carbs_g ?? '?'}g | F ${item.fat_g ?? '?'}g`,
-    );
-  });
-  if (mealNotes) {
-    lines.push('', `📝 *Notes:* ${escapeMarkdown(mealNotes)}`);
-  }
-  const totals = items.reduce((acc, item) => ({
-    calories: acc.calories + (item.calories_kcal ?? 0),
-    protein: acc.protein + (item.protein_g ?? 0),
-    carbs: acc.carbs + (item.carbs_g ?? 0),
-    fat: acc.fat + (item.fat_g ?? 0),
-  }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
-  lines.push(
-    '',
-    `📊 *Meal Totals:* ${Math.round(totals.calories)} kcal | P ${Math.round(totals.protein)}g | C ${Math.round(totals.carbs)}g | F ${Math.round(totals.fat)}g`,
-    '*Save this log?*',
-  );
-  return lines.join('\n');
-}
-
-function buildTotalsMessage(rows: TodayFoodRow[]): string {
-  const totals = rows.reduce((acc, row) => ({
-    calories: acc.calories + (row.calories ?? 0),
-    protein: acc.protein + (row.protein_g ?? 0),
-    carbs: acc.carbs + (row.carbs_g ?? 0),
-    fat: acc.fat + (row.fat_g ?? 0),
-  }), { calories: 0, protein: 0, carbs: 0, fat: 0 });
-
-  const groups: MealType[] = ['breakfast', 'lunch', 'dinner', 'others'];
-  const groupedRows = groups.map((meal) => ({
-    meal,
-    rows: rows.filter((row) => (row.meal_type ?? 'others') === meal),
-  }));
-
-  const lines = ["📅 *Today's food logs:*"];
-
-  for (const group of groupedRows) {
-    if (group.rows.length === 0) continue;
-    lines.push('', `*${mealTypeLabel(group.meal)}:*`);
-    group.rows.forEach((row, index) => {
-      const quantityPrefix = row.quantity && row.unit ? `${row.quantity} ${row.unit} ` : '';
-      const time = row.created_at
-        ? ` [${new Date(row.created_at).getHours().toString().padStart(2, '0')}:${new Date(row.created_at).getMinutes().toString().padStart(2, '0')}]`
-        : '';
-      lines.push(
-        `${index + 1}. ${quantityPrefix}${escapeMarkdown(row.food_name)} - ${row.calories ?? '?'} kcal | P ${row.protein_g ?? '?'}g | C ${row.carbs_g ?? '?'}g | F ${row.fat_g ?? '?'}g${time}`,
-      );
-    });
-  }
-  lines.push(
-    '',
-    `✨ *Daily totals:* ${Math.round(totals.calories)} kcal | P ${Math.round(totals.protein)}g | C ${Math.round(totals.carbs)}g | F ${Math.round(totals.fat)}g`,
-  );
-  return lines.join('\n');
 }
 
 /**
@@ -228,10 +184,12 @@ async function handleFoodInput(
   image?: PendingImage,
 ): Promise<void> {
   const sessionId = crypto.randomUUID();
+  let placeholderMessageId: number | undefined;
 
   try {
     await sendChatAction(env, chatId, 'typing');
-    await sendTelegramMessage(env, chatId, `⏳ Calculating nutrients for ${mealTypeLabel(mealType)}...`);
+    const placeholder = await sendTelegramMessage(env, chatId, `⏳ Calculating nutrients for ${mealTypeLabel(mealType)}...`);
+    placeholderMessageId = placeholder.ok ? placeholder.messageId : undefined;
 
     const extracted = await extractFoodFromInput(
       env,
@@ -259,15 +217,25 @@ async function handleFoodInput(
       pending_source_image: undefined,
     });
 
-    await sendTelegramMessageWithKeyboard(
-      env,
-      chatId,
-      formatPreview(pendingLog.items, pendingLog.meal_notes),
-      buildInlineKeyboard(sessionId),
-    );
+    const previewText = formatPreview(pendingLog.items, pendingLog.meal_notes);
+    const keyboard = buildInlineKeyboard(sessionId);
+
+    // Turn the "⏳ Calculating..." placeholder into the final result in
+    // place instead of sending a second message — feels faster, and keeps
+    // the chat from filling up with throwaway status messages.
+    const edited = placeholderMessageId
+      ? await editMessageText(env, chatId, placeholderMessageId, previewText, { replyMarkup: keyboard })
+      : { ok: false as const };
+    if (!edited.ok) {
+      await sendTelegramMessageWithKeyboard(env, chatId, previewText, keyboard);
+    }
   } catch (error: any) {
     console.error('handleFoodInput failed', { message: error?.message, telegramId });
-    await sendTelegramMessage(env, chatId, friendlyErrorMessage(error));
+    const errorMessage = friendlyErrorMessage(error);
+    const edited = placeholderMessageId ? await editMessageText(env, chatId, placeholderMessageId, errorMessage) : { ok: false as const };
+    if (!edited.ok) {
+      await sendTelegramMessage(env, chatId, errorMessage);
+    }
   }
 }
 
@@ -296,12 +264,24 @@ async function beginTextLogging(
     return;
   }
 
+  // "breakfast 2 eggs and toast" — skip the meal-type keyboard entirely.
+  const prefixed = extractMealTypePrefix(text);
+  if (prefixed) {
+    await handleFoodInput(env, message.chat.id, telegramId, prefixed.rest, prefixed.mealType);
+    return;
+  }
+
   await saveState(env, telegramId, 'awaiting_food_input', {
     ...state.context,
     pending_source_text: text,
     pending_source_image: undefined,
   });
-  await sendTelegramMessageWithKeyboard(env, message.chat.id, 'What type of meal is this?', buildMealSelectionKeyboard());
+  await sendTelegramMessageWithKeyboard(
+    env,
+    message.chat.id,
+    'What type of meal is this?\n_Tip: next time, start with "breakfast", "lunch", "dinner" or "snack" to skip this step._',
+    buildMealSelectionKeyboard(),
+  );
 }
 
 /** Entry point for a photo message: downloads/validates the image, then mirrors the text flow. */
@@ -340,12 +320,21 @@ async function handlePhotoMessage(
     }
   }
 
-  const image: PendingImage = { data: downloaded.data, mimeType: downloaded.mimeType, caption };
-
   if (state.context.selected_meal_type) {
+    const image: PendingImage = { data: downloaded.data, mimeType: downloaded.mimeType, caption };
     await handleFoodInput(env, message.chat.id, telegramId, caption ?? '', state.context.selected_meal_type, image);
     return;
   }
+
+  // A caption like "lunch chicken rice" skips the meal-type keyboard too.
+  const prefixed = caption ? extractMealTypePrefix(caption) : null;
+  if (prefixed) {
+    const image: PendingImage = { data: downloaded.data, mimeType: downloaded.mimeType, caption: prefixed.rest };
+    await handleFoodInput(env, message.chat.id, telegramId, prefixed.rest, prefixed.mealType, image);
+    return;
+  }
+
+  const image: PendingImage = { data: downloaded.data, mimeType: downloaded.mimeType, caption };
 
   await saveState(env, telegramId, 'awaiting_food_input', {
     ...state.context,
@@ -583,7 +572,7 @@ export async function handleTelegramUpdate(env: Env, update: TelegramUpdate): Pr
       await sendTelegramMessage(env, message.chat.id, '📭 No logs for today yet.');
       return;
     }
-    await sendTelegramMessage(env, message.chat.id, buildTotalsMessage(rows));
+    await sendTelegramMessage(env, message.chat.id, buildTotalsMessage(rows, user.calorie_goal));
     return;
   }
 

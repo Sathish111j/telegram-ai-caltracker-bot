@@ -11,6 +11,7 @@ export interface TelegramApiResult {
   ok: boolean;
   error?: string;
   retryAfter?: number;
+  messageId?: number;
 }
 
 function ensureBotToken(env: Env): string {
@@ -63,7 +64,8 @@ async function telegramRequest(
   }
 
   if (response.ok && body?.ok) {
-    return { ok: true };
+    const result = body.result as { message_id?: number } | undefined;
+    return { ok: true, messageId: result?.message_id };
   }
 
   const retryAfter = body?.parameters?.retry_after;
@@ -102,6 +104,27 @@ export async function sendTelegramMessageWithKeyboard(
     text: truncateTelegramText(text),
     reply_markup: replyMarkup,
     ...(options?.markdown !== false ? { parse_mode: 'Markdown' } : {}),
+  });
+}
+
+/**
+ * Edits an existing message's text in place (optionally replacing its
+ * keyboard) — used to turn a "⏳ working..." placeholder into the final
+ * result without sending a second message.
+ */
+export async function editMessageText(
+  env: Env,
+  chatId: number,
+  messageId: number,
+  text: string,
+  options?: { markdown?: boolean; replyMarkup?: Record<string, unknown> },
+): Promise<TelegramApiResult> {
+  return telegramRequest(env, 'editMessageText', {
+    chat_id: chatId,
+    message_id: messageId,
+    text: truncateTelegramText(text),
+    ...(options?.markdown !== false ? { parse_mode: 'Markdown' } : {}),
+    ...(options?.replyMarkup ? { reply_markup: options.replyMarkup } : {}),
   });
 }
 
