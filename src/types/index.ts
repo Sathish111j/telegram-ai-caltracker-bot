@@ -2,16 +2,33 @@ import { type Sql } from 'postgres';
 
 export interface Env {
   DATABASE_URL?: string;
+  DIRECT_URL?: string;
   GEMINI_MODEL?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
+  HYPERDRIVE?: { connectionString: string };
   sql?: Sql;
 }
 
+export interface TelegramPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
 export interface TelegramMessage {
-  chat: { id: number };
+  chat: { id: number; type?: string };
   message_id?: number;
   text?: string;
+  caption?: string;
+  photo?: TelegramPhotoSize[];
+  voice?: unknown;
+  document?: unknown;
+  sticker?: unknown;
+  video?: unknown;
+  audio?: unknown;
   from?: { id: number; first_name?: string };
 }
 
@@ -24,6 +41,7 @@ export interface TelegramCallbackQuery {
 
 export interface TelegramUpdate {
   message?: TelegramMessage;
+  edited_message?: TelegramMessage;
   callback_query?: TelegramCallbackQuery;
 }
 
@@ -112,6 +130,18 @@ export interface PendingLog {
 
 export type MealType = 'breakfast' | 'lunch' | 'dinner' | 'others';
 
+export interface PendingImage {
+  data: string;
+  mimeType: string;
+  caption?: string;
+}
+
+export interface PendingDelete {
+  food_item_id: number;
+  food_log_id: number;
+  food_name: string;
+}
+
 export interface OnboardingContext {
   onboarding?: {
     step: 'name' | 'timezone' | 'calorie_goal';
@@ -127,7 +157,10 @@ export interface OnboardingContext {
     source_text: string;
   };
   pending_source_text?: string;
+  pending_source_image?: PendingImage;
   selected_meal_type?: MealType;
+  pending_delete?: PendingDelete[];
+  awaiting_reset_confirm?: boolean;
 }
 
 export interface ConversationState {
@@ -160,117 +193,15 @@ export interface SummaryPayload {
 
 export type ReportType = 'daily' | 'weekly' | 'meal_gap';
 
-export type Intent = 'food_log' | 'weight' | 'supplement' | 'query';
-
 export interface SanitizeResult {
   clean: boolean;
   blockedPattern?: string;
 }
 
-type ExportFoodBase = Pick<
-  FoodItem,
-  | 'quantity'
-  | 'unit'
-  | 'calories_kcal'
-  | 'protein_g'
-  | 'carbs_g'
-  | 'fat_g'
-  | 'fiber_g'
-  | 'sugar_g'
-  | 'net_carbs_g'
-  | 'saturated_fat_g'
-  | 'trans_fat_g'
-  | 'monounsaturated_fat_g'
-  | 'polyunsaturated_fat_g'
-  | 'cholesterol_mg'
-  | 'sodium_mg'
-  | 'potassium_mg'
-  | 'calcium_mg'
-  | 'iron_mg'
-  | 'magnesium_mg'
-  | 'phosphorus_mg'
-  | 'zinc_mg'
-  | 'selenium_mcg'
-  | 'vitamin_a_mcg'
-  | 'vitamin_c_mg'
-  | 'vitamin_d_mcg'
-  | 'vitamin_e_mg'
-  | 'vitamin_k_mcg'
-  | 'vitamin_b1_mg'
-  | 'vitamin_b2_mg'
-  | 'vitamin_b3_mg'
-  | 'vitamin_b5_mg'
-  | 'vitamin_b6_mg'
-  | 'vitamin_b9_mcg'
-  | 'vitamin_b12_mcg'
-  | 'glycemic_index'
-  | 'glycemic_load'
-  | 'omega3_g'
-  | 'omega6_g'
-  | 'water_content_g'
->;
-
-export interface ExportFoodLogRow extends ExportFoodBase {
-  log_date: string;
-  meal_type: string | null;
+export interface TodayFoodMatch {
+  food_item_id: number;
+  food_log_id: number;
   food_name: string;
-  created_at: string;
-}
-
-export interface ExportDailyTotalRow extends Omit<ExportFoodBase, 'quantity' | 'unit'> {
-  log_date: string;
-}
-
-export interface ExportWeeklyAverageRow extends Omit<ExportFoodBase, 'quantity' | 'unit'> {
-  week_start: string;
-}
-
-export interface ExportMicronutrientHeatmapRow
-  extends Pick<
-    FoodItem,
-    | 'sodium_mg'
-    | 'potassium_mg'
-    | 'calcium_mg'
-    | 'iron_mg'
-    | 'magnesium_mg'
-    | 'phosphorus_mg'
-    | 'zinc_mg'
-    | 'selenium_mcg'
-    | 'vitamin_a_mcg'
-    | 'vitamin_c_mg'
-    | 'vitamin_d_mcg'
-    | 'vitamin_e_mg'
-    | 'vitamin_k_mcg'
-    | 'vitamin_b1_mg'
-    | 'vitamin_b2_mg'
-    | 'vitamin_b3_mg'
-    | 'vitamin_b5_mg'
-    | 'vitamin_b6_mg'
-    | 'vitamin_b9_mcg'
-    | 'vitamin_b12_mcg'
-  > {
-  log_date: string;
-}
-
-export interface ExportSupplementRow {
-  log_date: string;
-  log_time: string | null;
-  name: string;
-  brand: string | null;
-  form: string | null;
-  servings: number | null;
-  dose: number | null;
-  calories_kcal: number | null;
-  protein_g: number | null;
-  carbs_g: number | null;
-  fat_g: number | null;
-  type_color: string | null;
-}
-
-export interface ExportGoalContext {
-  calorie_goal: number | null;
-  protein_goal_g: number | null;
-  carb_goal_g: number | null;
-  fat_goal_g: number | null;
-  fiber_goal_g: number | null;
+  quantity: number | null;
+  unit: FoodUnit | null;
 }

@@ -49,20 +49,3 @@ export const ALL_NUMERIC_NUTRIENT_KEYS: Array<keyof FoodItem> = [
   ...SCALABLE_NUTRIENT_KEYS,
   'glycemic_index',
 ];
-
-export function rescaleNutrients(item: FoodItem, newQuantity: number): FoodItem {
-  if (!item.quantity || item.quantity <= 0) {
-    return { ...item, quantity: newQuantity };
-  }
-  const factor = newQuantity / item.quantity;
-  const next: FoodItem = { ...item, quantity: newQuantity };
-
-  for (const key of SCALABLE_NUTRIENT_KEYS) {
-    const value = next[key];
-    if (typeof value === 'number') {
-      (next[key] as number) = Math.round(value * factor * 100) / 100;
-    }
-  }
-
-  return next;
-}

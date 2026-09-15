@@ -1,6 +1,15 @@
 # Copy to .dev.vars for local wrangler dev testing.
-# Gemini API key is loaded from DB table gemini_keys at runtime.
+# Gemini API key(s) are loaded from the DB table `gemini_keys` at runtime, not from an env var.
+
+# Pooled/runtime connection used by the Worker at request time (falls back to this
+# when the HYPERDRIVE binding isn't configured, e.g. in local `wrangler dev`).
 DATABASE_URL=postgresql://user:password@host:5432/dbname
+
+# Direct (non-pooled) connection used ONLY by Prisma for migrations/`db push`
+# (`npm run prisma:push`, `npm run prisma:generate`). Never wire this into
+# Hyperdrive or the runtime connection — schema changes need a direct connection.
+DIRECT_URL=postgresql://user:password@host:5432/dbname
+
 TELEGRAM_BOT_TOKEN=123456:telegram-token
 TELEGRAM_WEBHOOK_SECRET=replace-with-random-secret
 GEMINI_MODEL=gemini-2.5-flash

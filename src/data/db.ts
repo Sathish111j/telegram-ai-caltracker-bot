@@ -2,29 +2,42 @@ import postgres, { type Sql } from 'postgres';
 import {
   type ConversationState,
   type Env,
+  type FoodUnit,
   type GeminiKeyRecord,
   type OnboardingContext,
   type PendingLog,
   type ReportType,
   type SummaryPayload,
+  type TodayFoodMatch,
   type TodayFoodRow,
 } from '../types/index.js';
+
+/**
+ * Builds a fresh Postgres connection for this Worker invocation, preferring
+ * the Hyperdrive binding (edge-pooled) over a direct DATABASE_URL connection.
+ * The DATABASE_URL fallback keeps local `wrangler dev` working where
+ * Hyperdrive isn't provisioned.
+ */
+export function createDbConnection(env: Env): Sql {
+  const connectionString = env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error('Missing DATABASE_URL secret (or HYPERDRIVE binding).');
+  }
+
+  return postgres(connectionString, {
+    max: 5,
+    prepare: false,
+    idle_timeout: 20,
+    connect_timeout: 10,
+  });
+}
 
 function getDb(env: Env): Sql {
   if (env.sql) {
     return env.sql;
   }
 
-  if (!env.DATABASE_URL) {
-    throw new Error('Missing DATABASE_URL secret.');
-  }
-
-  return postgres(env.DATABASE_URL, {
-    max: 1,
-    prepare: false,
-    idle_timeout: 20,
-    connect_timeout: 10,
-  });
+  return createDbConnection(env);
 }
 
 /**
@@ -256,7 +269,7 @@ export async function saveFoodLog(env: Env, telegramId: string, pendingLog: Pend
       water_content_g: item.water_content_g,
       confidence_score: item.confidence_score,
       notes: item.notes,
-      raw_json: txn.json(item),
+      raw_json: txn.json(JSON.parse(JSON.stringify(item))),
       data_source: 'ai_text',
       is_deleted: false,
       created_at: now,
@@ -285,57 +298,6 @@ export async function getTodayFoods(env: Env, userId: number): Promise<TodayFood
       and fi.is_deleted = false
     order by fi.created_at asc
   `;
-}
-
-export async function softDeleteFoodForToday(env: Env, userId: number, namePart: string): Promise<string | null> {
-  const sql = getDb(env);
-  return sql.begin(async (transaction) => {
-    const txn = transaction as unknown as Sql;
-    const userRows = await txn<{ timezone: string }[]>`select timezone from users where id = ${userId} limit 1`;
-    const timezone = userRows[0]?.timezone || 'UTC';
-
-    const targetRows = await txn<{ food_item_id: number; food_log_id: number; food_name: string }[]>`
-      select fi.id as food_item_id, fl.id as food_log_id, fi.name as food_name
-      from food_items fi
-      join food_logs fl on fl.id = fi.food_log_id
-      where fl.user_id = ${userId}
-        and fl.log_date = (now() at time zone ${timezone})::date
-        and fl.confirmed = true
-        and fl.is_deleted = false
-        and fi.is_deleted = false
-        and lower(fi.name) like ${`%${namePart.toLowerCase()}%`}
-      order by fi.created_at desc
-      limit 1
-    `;
-
-    if (targetRows.length === 0) {
-      return null;
-    }
-
-    const target = targetRows[0];
-    await txn`
-      update food_items
-      set is_deleted = true, updated_at = now()
-      where id = ${target.food_item_id}
-    `;
-
-    const remaining = await txn<{ count: number }[]>`
-      select count(*)::int as count
-      from food_items
-      where food_log_id = ${target.food_log_id}
-        and is_deleted = false
-    `;
-
-    if ((remaining[0]?.count ?? 0) === 0) {
-      await txn`
-        update food_logs
-        set is_deleted = true, updated_at = now()
-        where id = ${target.food_log_id}
-      `;
-    }
-
-    return target.food_name;
-  });
 }
 
 export async function getDueDailyReportTelegramIds(env: Env): Promise<string[]> {
@@ -374,7 +336,7 @@ export async function getDueWeeklyReportTelegramIds(env: Env): Promise<string[]>
   return rows.map((row) => row.telegram_id);
 }
 
-export async function getMealGapTelegramIds(env: Env, hours: number): Promise<string[]> {
+export async function getMealGapTelegramIds(env: Env, hours: number, reminderCooldownHours: number): Promise<string[]> {
   const sql = getDb(env);
   const rows = await sql<{ telegram_id: string }[]>`
     select u.telegram_id
@@ -386,6 +348,13 @@ export async function getMealGapTelegramIds(env: Env, hours: number): Promise<st
         and fl.confirmed = true
         and fl.is_deleted = false
         and fl.created_at >= now() - (${hours} * interval '1 hour')
+    )
+    and not exists (
+      select 1
+      from report_send_log r
+      where r.telegram_id = u.telegram_id
+        and r.report_type = 'meal_gap'
+        and r.created_at >= now() - (${reminderCooldownHours} * interval '1 hour')
     )
     order by u.id asc
   `;
@@ -489,34 +458,127 @@ export async function resetDailyAiCounters(env: Env): Promise<number> {
   return rows[0]?.count ?? 0;
 }
 
-export async function hardPurgeDeleted(
-  env: Env,
-): Promise<{ users: number; food_logs: number; food_items: number; supplements: number }> {
+export async function hardPurgeDeleted(env: Env): Promise<{ food_logs: number; food_items: number }> {
   const sql = getDb(env);
 
-  const purgeTable = async (tableName: 'users' | 'food_logs' | 'food_items' | 'supplement_logs'): Promise<number> => {
-    const rows = await sql<{ count: number }[]>`
-      with deleted as (
-        delete from ${sql(tableName)}
-        where is_deleted = true
-        returning 1
-      )
-      select count(*)::int as count
-      from deleted
+  return sql.begin(async (transaction) => {
+    const txn = transaction as unknown as Sql;
+
+    const purgeTable = async (tableName: 'food_logs' | 'food_items'): Promise<number> => {
+      const rows = await txn<{ count: number }[]>`
+        with deleted as (
+          delete from ${txn(tableName)}
+          where is_deleted = true
+          returning 1
+        )
+        select count(*)::int as count
+        from deleted
+      `;
+
+      return rows[0]?.count ?? 0;
+    };
+
+    // Children first: food_items references food_logs.
+    const foodItems = await purgeTable('food_items');
+    const foodLogs = await purgeTable('food_logs');
+
+    return { food_logs: foodLogs, food_items: foodItems };
+  });
+}
+
+/**
+ * Self-heals Gemini keys that were deactivated during a transient outage:
+ * re-activates any key that's been inactive for at least the cooldown period.
+ */
+export async function reactivateStaleKeys(env: Env, cooldownHours = 24): Promise<number> {
+  const sql = getDb(env);
+  const rows = await sql<{ count: number }[]>`
+    with reactivated as (
+      update gemini_keys
+      set is_active = true, fail_count = 0, updated_at = now()
+      where is_active = false
+        and updated_at <= now() - (${cooldownHours} * interval '1 hour')
+      returning 1
+    )
+    select count(*)::int as count
+    from reactivated
+  `;
+
+  return rows[0]?.count ?? 0;
+}
+
+/**
+ * Finds today's non-deleted, confirmed food items whose name matches
+ * `namePart` for a `/delete` confirmation prompt — nothing is deleted here.
+ */
+export async function findTodayFoodMatches(env: Env, userId: number, namePart: string): Promise<TodayFoodMatch[]> {
+  const sql = getDb(env);
+  const userRows = await sql<{ timezone: string }[]>`select timezone from users where id = ${userId} limit 1`;
+  const timezone = userRows[0]?.timezone || 'UTC';
+
+  const rows = await sql<{ food_item_id: number; food_log_id: number; food_name: string; quantity: number | null; unit: string | null }[]>`
+    select fi.id as food_item_id, fl.id as food_log_id, fi.name as food_name, fi.quantity, fi.unit
+    from food_items fi
+    join food_logs fl on fl.id = fi.food_log_id
+    where fl.user_id = ${userId}
+      and fl.log_date = (now() at time zone ${timezone})::date
+      and fl.confirmed = true
+      and fl.is_deleted = false
+      and fi.is_deleted = false
+      and lower(fi.name) like ${`%${namePart.toLowerCase()}%`}
+    order by fi.created_at desc
+    limit 5
+  `;
+
+  return rows.map((row) => ({ ...row, unit: row.unit as FoodUnit | null }));
+}
+
+/**
+ * Soft-deletes one specific food item by id (scoped to the owning user), used
+ * only after the user has confirmed the `/delete` match. Cascades the parent
+ * food_log's soft-delete if it has no remaining non-deleted items.
+ */
+export async function softDeleteFoodItemById(env: Env, userId: number, foodItemId: number): Promise<string | null> {
+  const sql = getDb(env);
+  return sql.begin(async (transaction) => {
+    const txn = transaction as unknown as Sql;
+
+    const targetRows = await txn<{ food_item_id: number; food_log_id: number; food_name: string }[]>`
+      select fi.id as food_item_id, fl.id as food_log_id, fi.name as food_name
+      from food_items fi
+      join food_logs fl on fl.id = fi.food_log_id
+      where fi.id = ${foodItemId}
+        and fl.user_id = ${userId}
+        and fi.is_deleted = false
+      limit 1
     `;
 
-    return rows[0]?.count ?? 0;
-  };
+    if (targetRows.length === 0) {
+      return null;
+    }
 
-  const foodItems = await purgeTable('food_items');
-  const foodLogs = await purgeTable('food_logs');
-  const supplements = await purgeTable('supplement_logs');
-  const users = await purgeTable('users');
+    const target = targetRows[0];
+    await txn`
+      update food_items
+      set is_deleted = true, updated_at = now()
+      where id = ${target.food_item_id}
+    `;
 
-  return {
-    users,
-    food_logs: foodLogs,
-    food_items: foodItems,
-    supplements,
-  };
+    const remaining = await txn<{ count: number }[]>`
+      select count(*)::int as count
+      from food_items
+      where food_log_id = ${target.food_log_id}
+        and is_deleted = false
+    `;
+
+    if ((remaining[0]?.count ?? 0) === 0) {
+      await txn`
+        update food_logs
+        set is_deleted = true, updated_at = now()
+        where id = ${target.food_log_id}
+      `;
+    }
+
+    return target.food_name;
+  });
 }

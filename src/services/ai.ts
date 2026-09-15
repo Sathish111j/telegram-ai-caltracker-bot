@@ -22,7 +22,19 @@ export class GeminiQuotaExhaustedError extends Error {
   }
 }
 
+/**
+ * Custom error for a Gemini call that didn't complete within the timeout.
+ */
+export class GeminiTimeoutError extends Error {
+  constructor() {
+    super('The AI took too long to respond.');
+  }
+}
+
 const DEFAULT_MODEL = 'gemini-2.5-flash';
+const GEMINI_TIMEOUT_MS = 25_000;
+const ALLOWED_FOOD_UNITS = new Set(['g', 'ml', 'piece', 'cup', 'tbsp', 'tsp', 'oz']);
+const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
 /**
  * Structured schema for food extraction.
@@ -108,18 +120,22 @@ IMPORTANT RULES:
  * Normalizes an item to ensure numeric precision and default values.
  */
 function normalizeItem(raw: any): FoodItem {
+  const parsedQuantity = Number(raw.quantity);
+  const unit = String(raw.unit || 'piece').toLowerCase();
+
   const item: any = {
     name: String(raw.name || 'Unknown food').trim(),
-    quantity: Number(raw.quantity) || 1,
-    unit: String(raw.unit || 'piece').toLowerCase() as any,
+    quantity: Number.isFinite(parsedQuantity) && parsedQuantity > 0 ? parsedQuantity : 1,
+    unit: ALLOWED_FOOD_UNITS.has(unit) ? unit : 'piece',
     confidence_score: typeof raw.confidence_score === 'number' ? Math.min(1, Math.max(0, raw.confidence_score)) : 0.5,
     notes: raw.notes ? String(raw.notes) : null,
   };
 
   for (const key of ALL_NUMERIC_NUTRIENT_KEYS) {
     const val = raw[key];
-    if (typeof val === 'number') {
-      item[key] = key === 'glycemic_index' ? Math.round(val) : Number(val.toFixed(2));
+    const numeric = typeof val === 'number' ? val : typeof val === 'string' && val.trim() !== '' ? Number(val) : NaN;
+    if (Number.isFinite(numeric) && numeric >= 0) {
+      item[key] = key === 'glycemic_index' ? Math.round(numeric) : Number(numeric.toFixed(2));
     } else {
       item[key] = null;
     }
@@ -132,6 +148,10 @@ function normalizeItem(raw: any): FoodItem {
  * End-to-end optimized food extraction using Gemini 2.5 Flash.
  */
 export async function extractFoodFromInput(env: Env, userText: string, image?: { data: string; mimeType: string }): Promise<GeminiResponse> {
+  if (image && !ALLOWED_IMAGE_MIME_TYPES.has(image.mimeType)) {
+    throw new Error(`Unsupported image type: ${image.mimeType}`);
+  }
+
   let attempts = 0;
   const attemptedKeyIds = new Set<number>();
 
@@ -139,32 +159,61 @@ export async function extractFoodFromInput(env: Env, userText: string, image?: {
     const key = await pickGeminiKey(env, [...attemptedKeyIds]);
     if (!key) throw new GeminiQuotaExhaustedError();
     attemptedKeyIds.add(key.id);
+    attempts++;
 
+    // Separate the network/API call from response parsing so a malformed
+    // (but successfully-delivered) response doesn't count against the key's
+    // health — only genuine API-reported failures should be able to
+    // permanently deactivate a key.
+    let response: any;
     try {
       const client = new GoogleGenAI({ apiKey: key.api_key });
-      
-      const response = await client.models.generateContent({
-        model: env.GEMINI_MODEL || DEFAULT_MODEL,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { text: userText },
-              ...(image ? [{ inlineData: { data: image.data, mimeType: image.mimeType } }] : [])
-            ]
-          }
-        ],
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          responseMimeType: 'application/json',
-          responseJsonSchema: FOOD_EXTRACTION_SCHEMA,
-          temperature: 0.1,
-        }
-      });
 
+      response = await withTimeout(
+        client.models.generateContent({
+          model: env.GEMINI_MODEL || DEFAULT_MODEL,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: userText },
+                ...(image ? [{ inlineData: { data: image.data, mimeType: image.mimeType } }] : []),
+              ],
+            },
+          ],
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            responseMimeType: 'application/json',
+            responseJsonSchema: FOOD_EXTRACTION_SCHEMA,
+            temperature: 0.1,
+          },
+        }),
+        GEMINI_TIMEOUT_MS,
+      );
+    } catch (error: any) {
+      const msg = safeErrorMessage(error).toLowerCase();
+      console.error('Gemini API Error', { message: msg, key: key.label });
+
+      if (error instanceof GeminiTimeoutError || msg.includes('timeout') || msg.includes('network') || msg.includes('fetch failed')) {
+        // Transient — don't penalize the key's health, just try another key/attempt.
+        continue;
+      }
+
+      if (msg.includes('quota') || msg.includes('429')) {
+        await markKeyExhausted(env, key.id);
+      } else {
+        const failCount = await incrementKeyFailCount(env, key.id);
+        if (failCount > 5) await deactivateKey(env, key.id);
+      }
+      continue;
+    }
+
+    // Parsing failures are a model/response issue, not evidence the key itself
+    // is unhealthy — don't touch key-health bookkeeping here.
+    try {
       const data = response.text ? JSON.parse(response.text) : { items: [] };
       const normalizedItems = (data.items || []).map(normalizeItem);
-      
+
       await touchGeminiKey(env, key.id);
 
       return {
@@ -177,19 +226,32 @@ export async function extractFoodFromInput(env: Env, userText: string, image?: {
         latencyMs: 0,
         keyLabel: key.label,
       };
-    } catch (error: any) {
-      console.error('Gemini API Error', { message: error.message, key: key.label });
-      
-      const msg = error.message.toLowerCase();
-      if (msg.includes('quota') || msg.includes('429')) {
-        await markKeyExhausted(env, key.id);
-      } else {
-        const failCount = await incrementKeyFailCount(env, key.id);
-        if (failCount > 5) await deactivateKey(env, key.id);
-      }
-      attempts++;
+    } catch (parseError: any) {
+      console.error('Gemini response parse error', { message: safeErrorMessage(parseError), key: key.label });
+      continue;
     }
   }
 
   throw new GeminiQuotaExhaustedError();
+}
+
+function safeErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error ?? 'Unknown error');
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new GeminiTimeoutError()), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }

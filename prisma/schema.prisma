@@ -21,9 +21,9 @@ model User {
   timezone     String?
   calorie_goal Int?
 
-  ai_calls_today Int    @default(0)
-  created_at   DateTime @default(now())
-  updated_at   DateTime @updatedAt
+  ai_calls_today Int      @default(0)
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
 
   food_logs FoodLog[]
 
@@ -74,6 +74,7 @@ model FoodLog {
 
   @@index([user_id, log_date])
   @@index([created_at])
+  @@index([user_id, created_at])
   @@map("food_logs")
 }
 
@@ -131,6 +132,7 @@ model FoodItem {
   food_log FoodLog @relation(fields: [food_log_id], references: [id], onDelete: Cascade)
 
   @@index([food_log_id])
+  @@index([food_log_id, is_deleted])
   @@map("food_items")
 }
 

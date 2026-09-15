@@ -1,4 +1,5 @@
 import postgres from 'postgres';
+import { createDbConnection } from './data/db.js';
 import {
   runDailyReportJob,
   runHardPurgeDeletedJob,
@@ -45,14 +46,20 @@ export default {
     if (pathname === '/telegram-webhook') {
       if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
-      if (env.TELEGRAM_WEBHOOK_SECRET) {
-        const incomingSecret = request.headers.get('x-telegram-bot-api-secret-token');
-        if (incomingSecret !== env.TELEGRAM_WEBHOOK_SECRET) return new Response('Unauthorized', { status: 401 });
+      // Fail closed: if the secret isn't configured server-side, refuse every
+      // request rather than accepting arbitrary unauthenticated updates.
+      if (!env.TELEGRAM_WEBHOOK_SECRET) {
+        console.error('TELEGRAM_WEBHOOK_SECRET is not configured — rejecting webhook request.');
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const incomingSecret = request.headers.get('x-telegram-bot-api-secret-token');
+      if (incomingSecret !== env.TELEGRAM_WEBHOOK_SECRET) {
+        return new Response('Unauthorized', { status: 401 });
       }
 
-      // Sequential database connection
-      const sql = postgres(env.DATABASE_URL!, {
-        max: 1,
+      // One connection per request, closed on every exit path.
+      const sql = postgres(env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL!, {
+        max: 5,
         prepare: false,
         idle_timeout: 20,
         connect_timeout: 10,
@@ -60,17 +67,9 @@ export default {
 
       try {
         const update = (await request.json()) as TelegramUpdate;
-        
-        // NORMAL SEQUENTIAL PROCESSING
-        const response = await handleTelegramUpdate({ ...env, sql }, update);
-
+        await handleTelegramUpdate({ ...env, sql }, update);
         await sql.end().catch(() => {});
-
-        if (response) {
-          return Response.json(response);
-        }
         return Response.json({ ok: true });
-        
       } catch (error: any) {
         console.error('Request failed', { error: error.message });
         await sql.end().catch(() => {});
@@ -83,9 +82,20 @@ export default {
 
   async scheduled(event: WorkerScheduledEvent, env: Env, ctx: WorkerExecutionContext): Promise<void> {
     ctx.waitUntil(
-      dispatchScheduled(event, env)
-        .then((result) => console.log('scheduled job complete', { result }))
-        .catch((error) => console.error('scheduled job failed', { error: error.message })),
+      (async () => {
+        // One shared connection for the whole cron invocation (threaded through
+        // via env.sql, which every db.ts function prefers over opening its own)
+        // instead of leaking a fresh connection per query/per user.
+        const sql = createDbConnection(env);
+        try {
+          const result = await dispatchScheduled(event, { ...env, sql });
+          console.log('scheduled job complete', { result });
+        } catch (error: any) {
+          console.error('scheduled job failed', { error: error.message });
+        } finally {
+          await sql.end().catch(() => {});
+        }
+      })(),
     );
   },
 };

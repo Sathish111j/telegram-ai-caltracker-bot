@@ -6,6 +6,14 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 GEMINI_MODEL = "gemini-2.5-flash"
 
+# Provision with:
+#   wrangler hyperdrive create nutribot-hyperdrive --connection-string="$DATABASE_URL"
+# then paste the returned id below. Pools/caches Postgres connections at the
+# edge so a Worker invocation never opens a fresh direct TCP connection.
+# [[hyperdrive]]
+# binding = "HYPERDRIVE"
+# id = "<hyperdrive-config-id>"
+
 [observability]
 enabled = true
 
