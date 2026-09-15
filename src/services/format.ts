@@ -3,11 +3,11 @@ import { type FoodItem, type MealType, type TodayFoodRow } from '../types/index.
 
 // Kept deliberately narrow: Telegram's mobile clients *soft-wrap* long lines
 // inside ``` code blocks instead of scrolling them, which destroys column
-// alignment the moment a row is wider than the screen. A long food name or a
-// bulky quantity string used to push rows past 45+ characters — this table
-// only carries Food/Qty/Kcal (protein/carbs/fat move to a summary line
-// outside the block) so no row can ever exceed ~26 characters, comfortably
-// under the wrap width of even the narrowest phone screens.
+// alignment the moment a row is wider than the screen. The main row only
+// carries Food/Qty/Kcal (protein/carbs/fat go on their own short indented
+// line right below, via macroSubline) so no single line ever exceeds ~27
+// characters — comfortably under the wrap width of even the narrowest phone
+// screens, no matter how long a food name or how large a macro value gets.
 const COL = {
   food: 13,
   qty: 7,
@@ -35,6 +35,19 @@ function forTableCell(text: string): string {
 function kcalCell(value: number | null | undefined): string {
   const display = value === null || value === undefined ? '?' : String(Math.round(value));
   return padStart(display, COL.kcal);
+}
+
+function macroValue(value: number | null | undefined): string {
+  return value === null || value === undefined ? '?' : `${Math.round(value)}g`;
+}
+
+/**
+ * A short indented line under a table row carrying protein/carbs/fat — kept
+ * as its own line (not extra columns) so the main row never grows wide
+ * enough to risk wrapping, no matter how big the macro values get.
+ */
+function macroSubline(row: { protein: number | null; carbs: number | null; fat: number | null }): string {
+  return `  P ${macroValue(row.protein)}  C ${macroValue(row.carbs)}  F ${macroValue(row.fat)}`;
 }
 
 export interface TableRow {
@@ -71,7 +84,8 @@ export function macroLine(label: string, totals: MacroTotals): string {
 
 /**
  * Renders items as a narrow, aligned monospace table inside a ``` code
- * block. Content inside the fence is shown literally (Telegram doesn't
+ * block, with each row's protein/carbs/fat on their own indented line right
+ * below it. Content inside the fence is shown literally (Telegram doesn't
  * parse markdown there), so cell values only need backticks neutralized,
  * not full markdown-escaping.
  */
@@ -79,12 +93,16 @@ export function buildFoodTable(rows: TableRow[]): string {
   const header = `${padEnd('Food', COL.food)} ${padEnd('Qty', COL.qty)} ${padStart('Kcal', COL.kcal)}`;
   const separator = '-'.repeat(header.length);
 
-  const lines = rows.map((row) => `${padEnd(forTableCell(row.name), COL.food)} ${padEnd(forTableCell(row.qty), COL.qty)} ${kcalCell(row.calories)}`);
+  const lines: string[] = [];
+  for (const row of rows) {
+    lines.push(`${padEnd(forTableCell(row.name), COL.food)} ${padEnd(forTableCell(row.qty), COL.qty)} ${kcalCell(row.calories)}`);
+    lines.push(macroSubline(row));
+  }
 
   const totals = sumMacros(rows);
   const totalRow = `${padEnd('Total', COL.food)} ${padEnd('', COL.qty)} ${kcalCell(totals.calories)}`;
 
-  return ['```', header, separator, ...lines, separator, totalRow, '```'].join('\n');
+  return ['```', header, separator, ...lines, separator, totalRow, macroSubline(totals), '```'].join('\n');
 }
 
 export function mealTypeLabel(mealType: MealType | null | undefined): string {
@@ -129,7 +147,7 @@ export function formatPreview(items: FoodItem[], mealNotes?: string | null): str
     }),
   );
 
-  const lines = ['🥗 *Nutrient Breakdown*', buildFoodTable(rows), macroLine('📊 *Total:*', sumMacros(rows))];
+  const lines = ['🥗 *Nutrient Breakdown*', buildFoodTable(rows)];
   if (mealNotes) {
     lines.push(`📝 *Notes:* ${escapeMarkdown(mealNotes)}`);
   }
@@ -161,7 +179,7 @@ export function buildTotalsMessage(rows: TodayFoodRow[], calorieGoal?: number | 
 
   for (const group of groupedRows) {
     if (group.rows.length === 0) continue;
-    sections.push(`${macroLine(`*${mealTypeLabel(group.meal)}* —`, sumMacros(group.rows))}\n${buildFoodTable(group.rows)}`);
+    sections.push(`*${mealTypeLabel(group.meal)}*\n${buildFoodTable(group.rows)}`);
   }
 
   const totals = sumMacros(rows.map(toRow));
